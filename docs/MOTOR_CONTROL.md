@@ -519,3 +519,686 @@ void foc_reconstruct_currents(float va, float vb, float vdc, float *ia, float *i
 
 ---
 
+### virtual_motor.c/.h (14KB)
+
+**Purpose:** Virtual motor simulation for testing control algorithms without hardware
+
+**Key Features:**
+- Simulates motor electrical and mechanical behavior
+- Models back-EMF, inductance, resistance
+- Provides realistic feedback for testing
+- Useful during development and algorithm validation
+
+**When to Use:**
+- Testing new control algorithms
+- Validating parameter changes
+- Development without hardware
+- Education and demonstration
+
+---
+
+## Control Modes
+
+The VESC supports multiple control modes, each suitable for different applications. The control mode is specified using the `mc_control_mode` enum.
+
+### 1. Duty Cycle Control (`CONTROL_MODE_DUTY`)
+
+**Function:** `mc_interface_set_duty(float dutyCycle)`
+
+**Description:** Directly controls the PWM duty cycle (0.0 to 1.0)
+
+**Use Cases:**
+- Direct voltage control
+- Testing and calibration
+- Simple open-loop control
+
+**Example:**
+```c
+// Set 50% duty cycle
+mc_interface_set_duty(0.5);
+```
+
+**Characteristics:**
+- No feedback control
+- Motor speed depends on load
+- Highest responsiveness
+- Requires external regulation
+
+---
+
+### 2. Current Control (`CONTROL_MODE_CURRENT`, `CONTROL_MODE_BRAKE_CURRENT`)
+
+**Functions:**
+- `mc_interface_set_current(float current)` - Motor current (Amps)
+- `mc_interface_set_brake_current(float current)` - Braking current (Amps)
+
+**Description:** Controls motor torque by regulating current
+
+**Use Cases:**
+- Torque control
+- Gentle acceleration/deceleration
+- Current limiting
+- Most e-bike/e-scooter applications
+
+**Example:**
+```c
+// Apply 10A motor current
+mc_interface_set_current(10.0);
+
+// Apply 5A braking current
+mc_interface_set_brake_current(5.0);
+```
+
+**Characteristics:**
+- **FOC Mode:** Controls Iq (torque-producing current)
+- Torque proportional to current: `Torque ≈ Kt × Current`
+- Speed varies with load
+- Smooth, predictable torque
+- Excellent for EVs and robotics
+
+---
+
+### 3. Speed Control (`CONTROL_MODE_SPEED`)
+
+**Function:** `mc_interface_set_pid_speed(float rpm)`
+
+**Description:** Maintains target RPM using a PID controller
+
+**Use Cases:**
+- Constant speed applications
+- Cruise control
+- Fans, pumps, conveyor belts
+- Any application requiring speed regulation
+
+**Example:**
+```c
+// Set target speed to 3000 ERPM (electrical RPM)
+mc_interface_set_pid_speed(3000.0);
+```
+
+**Characteristics:**
+- PID controller adjusts current to maintain speed
+- Compensates for load changes
+- Tunable gains (Kp, Ki, Kd)
+- Inner current control loop for torque
+- Requires proper PID tuning
+
+**Control Structure:**
+```
+Target RPM → [Speed PID] → Target Current → [Current Controller] → Motor
+                  ↑                                                    |
+                  └────────────────────────────────────────────────────┘
+                                    Measured RPM
+```
+
+---
+
+### 4. Position Control (`CONTROL_MODE_POS`)
+
+**Function:** `mc_interface_set_pid_pos(float pos)`
+
+**Description:** Servo-like position control using cascaded PID controllers
+
+**Use Cases:**
+- Robotic joints
+- Steering actuators
+- Antenna positioning
+- CNC machines
+- Any servo application
+
+**Example:**
+```c
+// Move to position 90 degrees
+mc_interface_set_pid_pos(90.0);
+```
+
+**Characteristics:**
+- Requires position feedback (encoder)
+- Cascaded control: Position → Speed → Current
+- Highly accurate positioning
+- Tunable position and speed PID gains
+
+**Control Structure:**
+```
+Target Pos → [Pos PID] → Target RPM → [Speed PID] → Target Current → Motor
+               ↑                           ↑                            |
+               └─────────────────────────────────────────────────────────┘
+                        Measured Position & Speed
+```
+
+---
+
+### 5. Handbrake Mode (`CONTROL_MODE_HANDBRAKE`)
+
+**Function:** `mc_interface_set_handbrake(float current)`
+
+**Description:** Holds motor position using current
+
+**Use Cases:**
+- Parking brake
+- Holding position on slopes
+- Emergency stop
+- Preventing rollback
+
+**Example:**
+```c
+// Engage handbrake with 20A holding current
+mc_interface_set_handbrake(20.0);
+```
+
+**Characteristics:**
+- Actively holds position
+- Consumes power (battery drain)
+- Can generate significant heat
+- Not suitable for long-term holding
+
+---
+
+### 6. Open-Loop Modes
+
+These modes are used for testing, startup, and special applications:
+
+#### Open-Loop Current/RPM
+```c
+mc_interface_set_openloop_current(float current, float rpm);
+```
+- Spins motor at fixed RPM with specified current
+- No feedback required
+- Used for initial motor startup in sensorless mode
+
+#### Open-Loop Phase
+```c
+mc_interface_set_openloop_phase(float current, float phase);
+```
+- Applies current at specific electrical angle
+- Used for position detection and calibration
+
+#### Open-Loop Duty Cycle
+```c
+mc_interface_set_openloop_duty(float dutyCycle, float rpm);
+mc_interface_set_openloop_duty_phase(float dutyCycle, float phase);
+```
+- Direct voltage control at specified angle/speed
+- Used for testing and calibration
+
+---
+
+## Motor Configuration Parameters
+
+Configuration is stored in the `mc_configuration` structure defined in `datatypes.h`. Key parameters are defined in `motor/mcconf_default.h`.
+
+### Current Limits
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `l_current_max` | 60.0 A | Maximum motor current (acceleration) |
+| `l_current_min` | -60.0 A | Minimum motor current (braking) |
+| `l_in_current_max` | 99.0 A | Maximum input (battery) current |
+| `l_in_current_min` | -60.0 A | Minimum input current (regen) |
+| `l_max_abs_current` | 130.0 A | Absolute current limit (fault trigger) |
+
+### Voltage Limits
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `l_min_voltage` | 8.0 V | Minimum battery voltage |
+| `l_max_voltage` | 57.0 V | Maximum battery voltage (fault trigger) |
+| `l_battery_cut_start` | 10.0 V | Begin current limiting |
+| `l_battery_cut_end` | 8.0 V | Full current cutoff |
+
+### Speed Limits
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `l_rpm_max` | 100,000 ERPM | Maximum motor speed |
+| `l_rpm_min` | -100,000 ERPM | Minimum motor speed (reverse) |
+| `l_min_duty` | 0.005 | Minimum PWM duty cycle |
+| `l_max_duty` | 0.95 | Maximum PWM duty cycle |
+
+### Temperature Limits
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `l_lim_temp_fet_start` | 85°C | Begin MOSFET current limiting |
+| `l_lim_temp_fet_end` | 100°C | Full MOSFET shutdown |
+| `l_lim_temp_motor_start` | 85°C | Begin motor current limiting |
+| `l_lim_temp_motor_end` | 100°C | Full motor shutdown |
+
+### Speed PID Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `s_pid_kp` | 0.004 | Proportional gain |
+| `s_pid_ki` | 0.004 | Integral gain |
+| `s_pid_kd` | 0.0001 | Derivative gain |
+| `s_pid_kd_filter` | 0.2 | Derivative filter coefficient |
+
+**PID Tuning Tips:**
+- Start with Kp only, increase until oscillation, then reduce by 50%
+- Add Ki to eliminate steady-state error
+- Add Kd for faster response (use with caution - amplifies noise)
+- Adjust `s_pid_kd_filter` to smooth derivative term
+
+### FOC-Specific Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `foc_sensor_mode` | Sensorless, Encoder, Hall, or HFI variants |
+| `foc_current_kp` | Current loop proportional gain |
+| `foc_current_ki` | Current loop integral gain |
+| `foc_motor_r` | Motor resistance (mΩ) |
+| `foc_motor_l` | Motor inductance (μH) |
+| `foc_motor_flux_linkage` | Motor flux linkage |
+| `foc_observer_gain` | Sensorless observer gain |
+
+---
+
+## Using the Motor Control API
+
+### Example 1: Simple Current Control
+
+```c
+#include "mc_interface.h"
+
+void my_application(void) {
+    // Initialize motor control
+    mc_interface_init();
+
+    // Wait for calibration to complete
+    while (!mc_interface_dccal_done()) {
+        chThdSleepMilliseconds(1);
+    }
+
+    // Apply 15A of motor current
+    mc_interface_set_current(15.0);
+
+    // Run for 5 seconds
+    chThdSleepMilliseconds(5000);
+
+    // Brake with 10A
+    mc_interface_set_brake_current(10.0);
+
+    // Release motor
+    mc_interface_release_motor();
+}
+```
+
+### Example 2: Speed Control with Monitoring
+
+```c
+#include "mc_interface.h"
+
+void speed_control_example(void) {
+    float target_rpm = 5000.0;
+    float current_rpm;
+    float current;
+
+    // Set target speed
+    mc_interface_set_pid_speed(target_rpm);
+
+    // Monitor motor state
+    for (int i = 0; i < 100; i++) {
+        current_rpm = mc_interface_get_rpm();
+        current = mc_interface_get_tot_current();
+
+        // Check for faults
+        mc_fault_code fault = mc_interface_get_fault();
+        if (fault != FAULT_CODE_NONE) {
+            // Handle fault
+            const char* fault_str = mc_interface_fault_to_string(fault);
+            // Log error...
+            break;
+        }
+
+        chThdSleepMilliseconds(100);
+    }
+
+    mc_interface_release_motor();
+}
+```
+
+### Example 3: Position Control (Servo Mode)
+
+```c
+#include "mc_interface.h"
+
+void position_control_example(void) {
+    float target_positions[] = {0.0, 90.0, 180.0, 270.0, 360.0};
+
+    for (int i = 0; i < 5; i++) {
+        // Move to target position
+        mc_interface_set_pid_pos(target_positions[i]);
+
+        // Wait for position to be reached
+        float error;
+        do {
+            float current_pos = mc_interface_get_pid_pos_now();
+            error = fabsf(target_positions[i] - current_pos);
+            chThdSleepMilliseconds(10);
+        } while (error > 1.0); // Within 1 degree
+
+        // Hold position for 2 seconds
+        chThdSleepMilliseconds(2000);
+    }
+
+    mc_interface_release_motor();
+}
+```
+
+### Example 4: Reading Motor Statistics
+
+```c
+#include "mc_interface.h"
+
+void read_motor_stats(void) {
+    // Read current state
+    mc_state state = mc_interface_get_state();
+    float rpm = mc_interface_get_rpm();
+    float duty = mc_interface_get_duty_cycle_now();
+    float current = mc_interface_get_tot_current();
+    float voltage = mc_interface_get_input_voltage_filtered();
+
+    // Read temperatures
+    float temp_fet = mc_interface_temp_fet_filtered();
+    float temp_motor = mc_interface_temp_motor_filtered();
+
+    // Read energy consumption
+    float amp_hours = mc_interface_get_amp_hours(false);
+    float watt_hours = mc_interface_get_watt_hours(false);
+
+    // Read position
+    int tachometer = mc_interface_get_tachometer_value(false);
+    float distance = mc_interface_get_distance();
+
+    // For FOC mode, read d-q currents
+    if (state == MC_STATE_RUNNING) {
+        float id = mc_interface_read_reset_avg_id();
+        float iq = mc_interface_read_reset_avg_iq();
+        // Process FOC-specific data...
+    }
+}
+```
+
+---
+
+## Safety Features and Fault Protection
+
+The motor control system includes comprehensive safety features to protect hardware and users.
+
+### Fault Detection
+
+All faults trigger immediate motor shutdown and are reported via `mc_interface_get_fault()`:
+
+| Fault Code | Description | Cause |
+|------------|-------------|-------|
+| `FAULT_CODE_OVER_VOLTAGE` | Battery voltage too high | Regenerative braking, disconnected load |
+| `FAULT_CODE_UNDER_VOLTAGE` | Battery voltage too low | Discharged battery, poor connection |
+| `FAULT_CODE_ABS_OVER_CURRENT` | Excessive current | Short circuit, motor stall |
+| `FAULT_CODE_OVER_TEMP_FET` | MOSFETs overheating | Excessive current, poor cooling |
+| `FAULT_CODE_OVER_TEMP_MOTOR` | Motor overheating | Continuous high current |
+| `FAULT_CODE_DRV` | Gate driver fault | Hardware failure, shoot-through |
+| `FAULT_CODE_ENCODER_SPI` | Encoder communication error | Wiring issue, EMI |
+| `FAULT_CODE_UNBALANCED_CURRENTS` | Phase current mismatch | Hardware failure, poor calibration |
+
+### Soft Limits
+
+The firmware implements soft limiting before hard faults:
+
+1. **Current Limiting**:
+   - Gradually reduces current as temperature approaches limit
+   - Smooth transition prevents sudden loss of power
+
+2. **Voltage Limiting**:
+   - `battery_cut_start` to `battery_cut_end` provides gradual current reduction
+   - Prevents battery over-discharge
+   - Allows safe shutdown rather than sudden cutoff
+
+3. **Temperature Derating**:
+   - Linear reduction from `temp_start` to `temp_end`
+   - Prevents thermal shutdown during normal operation
+   - `temp_accel_dec` provides extra margin during acceleration
+
+### Current Measurement and Calibration
+
+**DC Current Calibration (`mcpwm_foc_dc_cal()`):**
+- Performed at startup
+- Measures ADC offsets for all three phase current sensors
+- Critical for accurate current measurement
+- Must complete before motor operation
+
+**Checking Calibration Status:**
+```c
+if (mc_interface_dccal_done()) {
+    // Safe to start motor
+}
+```
+
+### Deadtime Compensation
+
+**Problem:** Gate driver deadtime (time when both high and low side MOSFETs are off) causes voltage errors
+
+**Solution:** Firmware compensates by adjusting PWM duty cycles based on current direction
+
+**Configuration:** `HW_DEAD_TIME_NSEC` (typically 360ns)
+
+---
+
+## Advanced Topics
+
+### Observer-Based Sensorless Control
+
+**Purpose:** Estimate rotor position without sensors
+
+**Methods Available:**
+1. **Ortega Original** - Classic nonlinear observer
+2. **MxLemming** - Modified observer with better low-speed performance
+3. **Ortega Lambda Comp** - Ortega with flux linkage compensation
+4. **MxLemming Lambda Comp** - MxLemming with compensation
+5. **MXV** - Voltage-based observer
+6. **MXV variants** - With compensation and linearization
+
+**Key Parameters:**
+- `foc_observer_gain` - Higher gain = faster response, more noise sensitivity
+- `foc_observer_type` - Select observer algorithm
+
+**Limitations:**
+- Requires sufficient back-EMF (typically > 5% duty cycle)
+- Poor performance at very low speeds
+- Requires accurate motor parameters
+
+### High-Frequency Injection (HFI)
+
+**Purpose:** Enable sensorless operation at low speeds and standstill
+
+**Principle:**
+- Injects high-frequency signal into motor
+- Detects rotor position from magnetic saliency
+- Works even at zero speed
+
+**HFI Variants:**
+- **HFI_V2**: Original implementation
+- **HFI_V3**: Improved for interior permanent magnet motors
+- **HFI_V4**: Better noise rejection
+- **HFI_V5**: Optimized for surface-mount motors
+
+**Requirements:**
+- Motor must have magnetic saliency (not all motors work)
+- Proper HFI voltage and frequency tuning
+- May produce audible noise
+
+### Motor Parameter Detection
+
+VESC can automatically measure motor parameters:
+
+```c
+// Measure resistance
+float resistance;
+mcpwm_foc_measure_resistance(4.0, 1000, true, &resistance);
+
+// Measure inductance
+float inductance, ld_lq_diff, current;
+mcpwm_foc_measure_inductance(0.2, 1000, &current, &ld_lq_diff, &inductance);
+
+// Combined R-L measurement
+float res, ind, ld_lq;
+mcpwm_foc_measure_res_ind(&res, &ind, &ld_lq);
+```
+
+**When to Use:**
+- Setting up new motor
+- After hardware changes
+- Optimizing FOC performance
+
+---
+
+## Performance Considerations
+
+### PWM Frequency
+
+**Typical Values:** 20-40 kHz
+
+**Trade-offs:**
+- **Higher frequency:**
+  - Less audible noise
+  - Smoother current waveforms
+  - More switching losses
+  - Higher EMI
+
+- **Lower frequency:**
+  - Lower switching losses
+  - More efficient
+  - Audible noise
+  - Higher current ripple
+
+**Configuration:** Set in hardware configuration files
+
+### Control Loop Timing
+
+| Loop | Frequency | Period | Purpose |
+|------|-----------|--------|---------|
+| Current (FOC) | 20-40 kHz | 25-50 μs | Current control, FOC transforms |
+| Speed PID | 1 kHz | 1 ms | Speed regulation |
+| Position PID | 1 kHz | 1 ms | Position control |
+
+### CPU Load
+
+**FOC is computationally intensive:**
+- Clarke/Park transforms
+- Trigonometric functions
+- PI controllers
+- Observer calculations
+- Space vector modulation
+
+**Optimizations in VESC:**
+- Lookup tables for sine/cosine
+- Efficient fixed-point arithmetic
+- Optimized assembly for critical paths
+- DMA for ADC sampling
+
+---
+
+## Troubleshooting Common Issues
+
+### Motor Won't Spin
+
+1. **Check Fault Status:**
+   ```c
+   mc_fault_code fault = mc_interface_get_fault();
+   ```
+   - Address any fault codes
+
+2. **Verify Calibration:**
+   ```c
+   if (!mc_interface_dccal_done()) {
+       // Wait for calibration
+   }
+   ```
+
+3. **Check Configuration:**
+   - Motor type (BLDC vs FOC)
+   - Correct pole count
+   - Proper sensor mode
+
+4. **Test Motor Detection:**
+   - Use VESC Tool motor detection wizard
+   - Verify phase wire connections
+
+### Cogging/Rough Operation
+
+1. **FOC Mode:**
+   - Run motor detection to measure R, L, flux linkage
+   - Check encoder offset/direction
+   - Verify current sensor calibration
+
+2. **BLDC Mode:**
+   - Check Hall sensor connections
+   - Run Hall sensor detection
+   - Verify Hall sensor table
+
+### Excessive Heat
+
+1. **Check Current Limits:**
+   - Reduce `l_current_max`
+   - Verify motor current rating
+
+2. **Improve Cooling:**
+   - Add heatsinks
+   - Increase airflow
+   - Reduce duty cycle
+
+3. **Check Efficiency:**
+   - FOC typically more efficient than BLDC mode
+   - Optimize motor parameters
+
+### Position/Speed Oscillation
+
+1. **Reduce PID Gains:**
+   - Lower Kp first
+   - Reduce or remove Kd
+   - May need to lower Ki
+
+2. **Add Filtering:**
+   - Increase `s_pid_kd_filter`
+   - Enable current filtering
+
+3. **Check Mechanical:**
+   - Verify encoder mounting
+   - Check for mechanical play/backlash
+
+---
+
+## Summary
+
+The VESC motor control system provides:
+
+✅ **Multiple Control Methods:**
+- Trapezoidal BLDC (simple, reliable)
+- Advanced FOC (smooth, efficient)
+
+✅ **Flexible Control Modes:**
+- Duty cycle, current, speed, position
+- Open-loop and closed-loop
+
+✅ **Safety Features:**
+- Comprehensive fault detection
+- Soft limiting with thermal derating
+- Overcurrent/overvoltage protection
+
+✅ **Advanced Features:**
+- Sensorless operation with observers
+- HFI for low-speed/standstill
+- Automatic parameter detection
+- Real-time statistics and telemetry
+
+✅ **Production-Ready:**
+- Proven in thousands of applications
+- Extensive testing and validation
+- Active development and community support
+
+**Key Files Reference:**
+- `motor/mc_interface.c/.h` - Main API (mc_interface.c:28)
+- `motor/mcpwm_foc.c/.h` - FOC implementation (mcpwm_foc.c:29)
+- `motor/mcpwm.c/.h` - BLDC implementation (mcpwm.c:26)
+- `motor/foc_math.c/.h` - FOC mathematics (foc_math.c)
+- `motor/mcconf_default.h` - Configuration defaults (mcconf_default.h:23)
+
