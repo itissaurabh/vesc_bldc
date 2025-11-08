@@ -1164,3 +1164,1001 @@ void battery_level_indicator(float battery_percent) {
 **PWM Frequency:** Determined by `LEDPWM_CNT_TOP` (typically 200 → ~1kHz)
 **Resolution:** 8-bit effective (0-200 steps)
 **Update Rate:** Synchronous with timer ISR (1kHz typical)
+
+---
+
+## Servo Decoder
+
+### Overview
+
+The servo decoder (`servo_dec.c/h`) captures and decodes standard RC servo PWM signals (1-2ms pulses). This allows using RC receivers as input devices for motor control.
+
+**Location:** `driver/servo_dec.c`, `driver/servo_dec.h`
+
+### RC Servo PWM Protocol
+
+#### Theory of Operation
+
+Standard RC servo signals:
+- **Frame Rate:** 50Hz (20ms period) typical, can vary 40-200Hz
+- **Pulse Width:** 1000µs (min) to 2000µs (max), 1500µs (center)
+- **Signal:** Positive-going pulses on idle-low signal
+- **Channels:** Typically 1-8 channels, each on separate wire
+
+**Timing Diagram:**
+```
+           ┌──────┐              ┌──────┐
+Signal     │      │              │      │
+       ────┘      └──────────────┘      └─────
+           
+           ├──────┤
+           1000µs  = Full reverse/minimum
+           
+           ├────────────┤
+              1500µs    = Center/neutral
+           
+           ├──────────────────┤
+                  2000µs      = Full forward/maximum
+           
+           ├──────────────────────────────┤
+                    20ms                  = Frame period
+```
+
+**Decoded Range:**
+- **-1.0:** 1000µs (full reverse)
+- **0.0:** 1500µs (center/neutral)
+- **+1.0:** 2000µs (full forward)
+
+### API Reference
+
+#### Initialization
+
+```c
+void servodec_init(void (*d_func)(void));
+```
+
+Initializes servo decoder:
+- Configures input capture timer
+- Sets up interrupt handler
+- Starts pulse measurement
+
+**Parameters:**
+- `d_func` - Callback function called on each pulse reception (can be NULL)
+
+**Example:**
+```c
+void pulse_received_callback(void) {
+    // Called when new pulse detected
+    // Can be used for timeout reset or LED blink
+}
+
+servodec_init(pulse_received_callback);
+```
+
+#### Stop
+
+```c
+void servodec_stop(void);
+```
+
+Stops servo decoder and releases timer resources.
+
+#### Configuration
+
+```c
+void servodec_set_pulse_options(float start, float end, bool median_filter);
+```
+
+Configures pulse width mapping and filtering.
+
+**Parameters:**
+- `start` - Pulse width (ms) for -1.0 output (typically 1.0)
+- `end` - Pulse width (ms) for +1.0 output (typically 2.0)
+- `median_filter` - Enable 3-sample median filter
+
+**Example:**
+```c
+// Standard servo range: 1-2ms
+servodec_set_pulse_options(1.0f, 2.0f, true);
+
+// Extended range: 0.9-2.1ms
+servodec_set_pulse_options(0.9f, 2.1f, true);
+
+// Reversed direction
+servodec_set_pulse_options(2.0f, 1.0f, false);
+```
+
+#### Reading Decoded Value
+
+```c
+float servodec_get_servo(int servo_num);
+```
+
+Returns decoded servo position.
+
+**Parameters:**
+- `servo_num` - Channel number (0-7)
+
+**Returns:** Decoded value (-1.0 to +1.0), or 0.0 if no signal
+
+**Example:**
+```c
+float throttle = servodec_get_servo(0);  // Read channel 0
+float steering = servodec_get_servo(1);  // Read channel 1
+
+// Apply to motor control
+mc_interface_set_duty(throttle);
+```
+
+#### Pulse Timing
+
+```c
+float servodec_get_last_pulse_len(int servo_num);
+```
+
+Returns raw pulse length in milliseconds.
+
+**Returns:** Pulse width in ms (typically 1.0-2.0)
+
+```c
+uint32_t servodec_get_time_since_update(void);
+```
+
+Time since last pulse received (for timeout detection).
+
+**Returns:** Milliseconds since last pulse
+
+**Example:**
+```c
+if (servodec_get_time_since_update() > 500) {
+    // No signal for 500ms, stop motor
+    mc_interface_release_motor();
+}
+```
+
+#### Status Check
+
+```c
+bool servodec_is_running(void);
+```
+
+**Returns:** `true` if decoder is initialized and running
+
+### Practical Application
+
+#### RC Receiver Control
+
+```c
+#include "servo_dec.h"
+#include "mc_interface.h"
+#include "app.h"
+
+#define SERVO_TIMEOUT_MS  500
+
+void rc_control_init(void) {
+    // Initialize servo decoder
+    servodec_init(NULL);
+
+    // Configure for standard servo range with filtering
+    servodec_set_pulse_options(1.0f, 2.0f, true);
+}
+
+void rc_control_update(void) {
+    // Check for signal timeout
+    if (servodec_get_time_since_update() > SERVO_TIMEOUT_MS) {
+        // No RC signal, stop motor
+        mc_interface_release_motor();
+        return;
+    }
+
+    // Read throttle channel (channel 0)
+    float throttle = servodec_get_servo(0);
+
+    // Apply deadband (neutral zone)
+    if (fabsf(throttle) < 0.05f) {
+        throttle = 0.0f;
+    }
+
+    // Set motor duty cycle
+    mc_interface_set_duty(throttle);
+}
+
+// Call from periodic thread (e.g., 100Hz)
+void rc_control_thread(void *arg) {
+    while (1) {
+        rc_control_update();
+        chThdSleepMilliseconds(10);
+    }
+}
+```
+
+#### Multi-Channel RC Input
+
+```c
+void multi_channel_rc_control(void) {
+    // Channel assignments
+    float ch0 = servodec_get_servo(0);  // Throttle
+    float ch1 = servodec_get_servo(1);  // Steering
+    float ch2 = servodec_get_servo(2);  // Mode switch
+    float ch3 = servodec_get_servo(3);  // Auxiliary
+
+    // Check timeout on primary channel
+    if (servodec_get_time_since_update() > 500) {
+        mc_interface_release_motor();
+        return;
+    }
+
+    // 3-position mode switch on channel 2
+    int mode;
+    if (ch2 < -0.5f) {
+        mode = 0;  // Position 1
+    } else if (ch2 > 0.5f) {
+        mode = 2;  // Position 3
+    } else {
+        mode = 1;  // Position 2 (center)
+    }
+
+    switch (mode) {
+    case 0:
+        // Current control mode
+        mc_interface_set_current(ch0 * 30.0f);  // ±30A
+        break;
+
+    case 1:
+        // Duty cycle mode
+        mc_interface_set_duty(ch0);
+        break;
+
+    case 2:
+        // Speed control mode
+        mc_interface_set_pid_speed(ch0 * 5000.0f);  // ±5000 ERPM
+        break;
+    }
+}
+```
+
+### Hardware Considerations
+
+**Input Pin Requirements:**
+- Connect to timer input capture pin (defined in hardware config)
+- 5V tolerant GPIO recommended (RC receivers typically output 3.3V or 5V)
+- No external pull-up/down needed (configured internally)
+
+**Supported Frequencies:**
+- Standard: 50Hz (20ms period)
+- High-speed: up to 200Hz (5ms period)
+- Works with SBUS and other fast RC protocols after conversion
+
+---
+
+## PWM Servo Output
+
+### Overview
+
+The PWM servo output driver (`pwm_servo.c/h`) generates RC servo PWM signals (1-2ms pulses at 50Hz) for controlling external servos. This can be used for steering control, actuators, or other servo-driven mechanisms.
+
+**Location:** `driver/pwm_servo.c`, `driver/pwm_servo.h`
+
+### API Reference
+
+#### Initialization
+
+```c
+uint32_t pwm_servo_init(uint32_t freq_hz, float duty);
+```
+
+Initializes PWM output in generic PWM mode.
+
+**Parameters:**
+- `freq_hz` - PWM frequency in Hz
+- `duty` - Initial duty cycle (0.0-1.0)
+
+**Returns:** Actual frequency achieved
+
+**Example:**
+```c
+// 10kHz PWM at 50% duty
+uint32_t actual_freq = pwm_servo_init(10000, 0.5f);
+```
+
+```c
+void pwm_servo_init_servo(void);
+```
+
+Initializes in servo mode (50Hz, 1.5ms pulse).
+
+**Example:**
+```c
+pwm_servo_init_servo();  // Standard RC servo mode
+```
+
+#### Control
+
+```c
+float pwm_servo_set_duty(float duty);
+```
+
+Sets PWM duty cycle in generic mode.
+
+**Parameters:**
+- `duty` - Duty cycle 0.0 (0%) to 1.0 (100%)
+
+**Returns:** Actual duty cycle set
+
+```c
+void pwm_servo_set_servo_out(float output);
+```
+
+Sets servo position in servo mode.
+
+**Parameters:**
+- `output` - Servo position -1.0 (1ms) to +1.0 (2ms), 0.0 = center (1.5ms)
+
+**Example:**
+```c
+pwm_servo_set_servo_out(-1.0f);  // Full left (1ms)
+pwm_servo_set_servo_out(0.0f);   // Center (1.5ms)
+pwm_servo_set_servo_out(+1.0f);  // Full right (2ms)
+```
+
+#### Stop
+
+```c
+void pwm_servo_stop(void);
+```
+
+Stops PWM generation and releases timer.
+
+#### Status
+
+```c
+bool pwm_servo_is_running(void);
+```
+
+**Returns:** `true` if PWM output is active
+
+### Practical Applications
+
+#### Steering Servo Control
+
+```c
+#include "pwm_servo.h"
+#include "mc_interface.h"
+
+void steering_init(void) {
+    pwm_servo_init_servo();
+    pwm_servo_set_servo_out(0.0f);  // Center position
+}
+
+void update_steering(float motor_current) {
+    // Derive steering angle from motor current
+    // e.g., for differential steering
+    float steering_angle = motor_current / 20.0f;  // ±20A = ±1.0
+
+    // Clamp to valid range
+    if (steering_angle > 1.0f) steering_angle = 1.0f;
+    if (steering_angle < -1.0f) steering_angle = -1.0f;
+
+    pwm_servo_set_servo_out(steering_angle);
+}
+```
+
+#### Generic PWM Output
+
+```c
+// LED dimming with variable frequency PWM
+void led_pwm_init(void) {
+    pwm_servo_init(1000, 0.0f);  // 1kHz PWM, initially off
+}
+
+void set_led_brightness(float brightness) {
+    pwm_servo_set_duty(brightness);  // 0.0-1.0
+}
+
+// Motor speed control with 20kHz PWM
+void blower_motor_init(void) {
+    pwm_servo_init(20000, 0.0f);  // 20kHz PWM
+}
+
+void set_blower_speed(float speed_percent) {
+    pwm_servo_set_duty(speed_percent / 100.0f);
+}
+```
+
+---
+
+## NRF24L01+ Wireless Driver
+
+### Overview
+
+The NRF24L01+ driver provides 2.4GHz wireless communication using the Nordic Semiconductor NRF24L01+ transceiver chip. It enables remote control and telemetry for VESC applications.
+
+**Location:** `driver/nrf/`
+
+### Architecture
+
+The NRF driver has multiple layers:
+
+```
+┌─────────────────────────────────────┐
+│   nrf_driver.c/h                    │  High-level interface
+│   - Pairing                         │  - Packet routing
+│   - Configuration                   │  - Application integration
+└────────────┬────────────────────────┘
+             │
+┌────────────▼────────────────────────┐
+│   rfhelp.c/h                        │  Helper functions
+│   - CRC handling                    │  - Data send/receive
+│   - Address management              │
+└────────────┬────────────────────────┘
+             │
+┌────────────▼────────────────────────┐
+│   rf.c/h                            │  Low-level register access
+│   - SPI communication               │  - NRF24 register read/write
+│   - Mode control (TX/RX)            │
+└────────────┬────────────────────────┘
+             │
+┌────────────▼────────────────────────┐
+│   spi_sw.c/h                        │  Software SPI (bit-bang)
+└─────────────────────────────────────┘
+```
+
+### NRF24L01+ Overview
+
+**Features:**
+- **Frequency:** 2.4-2.525 GHz (125 channels)
+- **Data Rate:** 250kbps, 1Mbps, or 2Mbps
+- **Range:** 10-100m (depending on power and environment)
+- **Auto-Acknowledgment:** Hardware ACK with auto-retry
+- **Multi-ceiver:** 6 data pipes for star topology
+- **Packet Size:** 1-32 bytes
+- **CRC:** Hardware 1 or 2 byte CRC
+
+**Power Levels:**
+- 0dBm (1mW)
+- -6dBm
+- -12dBm
+- -18dBm
+
+### Data Structures
+
+```c
+typedef struct {
+    NRF_SPEED speed;         // Data rate
+    NRF_POWER power;         // TX power
+    NRF_CRC crc_type;        // CRC configuration
+    NRF_RETR_DELAY retry_delay;
+    unsigned char retries;   // Auto-retry count
+    unsigned char channel;   // RF channel (0-125)
+    unsigned char address[3];
+    bool send_crc_ack;
+} nrf_config;
+```
+
+### High-Level API
+
+#### Initialization
+
+```c
+bool nrf_driver_init(void);
+```
+
+Initializes NRF24L01+ driver:
+- Configures SPI interface
+- Resets and configures NRF chip
+- Sets up RX/TX modes
+- Starts background thread
+
+**Returns:** `true` on success
+
+```c
+void nrf_driver_init_ext_nrf(void);
+```
+
+Initializes external NRF module (if HW_HAS_NRF24_EXT defined).
+
+```c
+void nrf_driver_stop(void);
+```
+
+Stops NRF driver and powers down radio.
+
+#### Pairing
+
+```c
+void nrf_driver_start_pairing(int ms);
+```
+
+Starts pairing mode for specified duration.
+
+**Parameters:**
+- `ms` - Pairing timeout in milliseconds
+
+**Example:**
+```c
+// Enter pairing mode for 30 seconds
+nrf_driver_start_pairing(30000);
+
+// User presses button on remote
+// Remote sends pairing request
+// VESC stores remote address
+```
+
+```c
+bool nrf_driver_is_pairing(void);
+```
+
+**Returns:** `true` if currently in pairing mode
+
+#### Data Transfer
+
+```c
+void nrf_driver_send_buffer(unsigned char *data, unsigned int len);
+```
+
+Sends data packet over NRF.
+
+**Parameters:**
+- `data` - Data buffer to send
+- `len` - Data length (max 32 bytes)
+
+**Example:**
+```c
+// Send telemetry data
+struct telemetry {
+    float battery_voltage;
+    float motor_current;
+    int32_t erpm;
+} telem;
+
+telem.battery_voltage = mc_interface_get_input_voltage_filtered();
+telem.motor_current = mc_interface_get_tot_current_filtered();
+telem.erpm = mc_interface_get_rpm();
+
+nrf_driver_send_buffer((uint8_t*)&telem, sizeof(telem));
+```
+
+```c
+void nrf_driver_process_packet(unsigned char *buf, unsigned char len);
+```
+
+Processes received packet (called by driver internally).
+
+#### Control
+
+```c
+void nrf_driver_pause(int ms);
+```
+
+Temporarily pauses NRF communication.
+
+**Parameters:**
+- `ms` - Pause duration in milliseconds
+
+```c
+bool nrf_driver_ext_nrf_running(void);
+```
+
+**Returns:** `true` if external NRF module is active
+
+### Low-Level RF API
+
+The `rf.c/h` module provides direct register access:
+
+```c
+void rf_init(void);                           // Initialize NRF chip
+void rf_set_frequency(int freq);              // Set channel (2400 + freq MHz)
+void rf_set_power(NRF_POWER power);           // Set TX power
+void rf_set_speed(NRF_SPEED speed);           // Set data rate
+void rf_mode_rx(void);                        // Enter RX mode
+void rf_mode_tx(void);                        // Enter TX mode
+void rf_power_down(void);                     // Power down radio
+void rf_power_up(void);                       // Power up radio
+
+// Data transfer
+void rf_write_tx_payload(const char *data, int length);
+void rf_read_rx_payload(char *data, int length);
+int rf_status(void);                          // Read status register
+```
+
+### Practical Application
+
+#### Remote Control Receiver
+
+```c
+#include "nrf_driver.h"
+#include "mc_interface.h"
+
+void nrf_remote_init(void) {
+    if (!nrf_driver_init()) {
+        // NRF init failed
+        return;
+    }
+
+    // Check if pairing button pressed
+    if (button_is_pressed()) {
+        nrf_driver_start_pairing(30000);  // 30 second pairing window
+    }
+}
+
+// Packet format from remote
+struct remote_packet {
+    uint8_t throttle;    // 0-255
+    uint8_t brake;       // 0-255
+    uint8_t buttons;     // Button flags
+    uint16_t checksum;
+};
+
+void nrf_packet_handler(unsigned char *buf, unsigned char len) {
+    if (len != sizeof(struct remote_packet)) {
+        return;  // Invalid packet size
+    }
+
+    struct remote_packet *pkt = (struct remote_packet*)buf;
+
+    // Verify checksum
+    uint16_t calc_crc = crc16(buf, len - 2);
+    if (calc_crc != pkt->checksum) {
+        return;  // CRC error
+    }
+
+    // Convert throttle to -1.0 to +1.0
+    float throttle = ((float)pkt->throttle - 127.5f) / 127.5f;
+    float brake = pkt->brake / 255.0f;
+
+    // Apply control
+    if (brake > 0.1f) {
+        mc_interface_set_brake_current(brake * 30.0f);
+    } else {
+        mc_interface_set_current(throttle * 50.0f);
+    }
+
+    // Reset timeout (signal received)
+    app_disable_output(1000);  // 1 second timeout
+}
+```
+
+### Configuration Example
+
+```c
+#include "rfhelp.h"
+
+void configure_nrf(void) {
+    nrf_config conf = {
+        .speed = NRF_SPEED_1M,           // 1Mbps
+        .power = NRF_POWER_0DBM,         // Max power
+        .crc_type = NRF_CRC_2B,          // 2-byte CRC
+        .retry_delay = NRF_RETR_DELAY_1000US,
+        .retries = 3,
+        .channel = 76,                   // 2.476 GHz
+        .address = {0xC6, 0xC5, 0xC4},
+        .send_crc_ack = true
+    };
+
+    rfhelp_update_conf(&conf);
+    rfhelp_restart();
+}
+```
+
+---
+
+## LoRa SX1278 Driver
+
+### Overview
+
+The SX1278 driver provides long-range wireless communication using the Semtech SX1278 LoRa (Long Range) transceiver. LoRa offers much greater range than NRF24L01+ at the cost of lower data rates.
+
+**Location:** `driver/lora/`
+
+### LoRa Overview
+
+**LoRa (Long Range) Technology:**
+- **Modulation:** Chirp Spread Spectrum (CSS)
+- **Frequency:** 433MHz, 868MHz, or 915MHz (regional)
+- **Range:** 2-15km line-of-sight, 500m-2km urban
+- **Data Rate:** 0.3-50 kbps (configurable)
+- **Power:** Up to +20dBm (100mW)
+
+**Key LoRa Parameters:**
+
+1. **Spreading Factor (SF):** 6-12
+   - Higher SF = longer range, lower data rate
+   - SF7: ~5.5 kbps, shorter range
+   - SF12: ~250 bps, maximum range
+
+2. **Bandwidth:** 7.8kHz - 500kHz
+   - Lower BW = better sensitivity, lower data rate
+
+3. **Coding Rate:** 4/5, 4/6, 4/7, 4/8
+   - Error correction redundancy
+
+### Data Structures
+
+```c
+typedef struct {
+    uint64_t frequency;      // Frequency in Hz
+    uint8_t power;           // TX power level
+    uint8_t LoRa_SF;         // Spreading factor
+    uint8_t LoRa_BW;         // Bandwidth
+    uint8_t LoRa_CR;         // Coding rate
+    uint8_t LoRa_CRC_sum;    // CRC enable/disable
+    uint8_t packetLength;    // Max packet size
+
+    SX1278_Status_t status;  // Current status
+    uint8_t rxBuffer[256];   // Receive buffer
+    uint8_t readBytes;       // Bytes available
+} SX1278_t;
+```
+
+### API Reference
+
+#### Initialization
+
+```c
+void lora_init(void);
+```
+
+Initializes LoRa module (defined in `lora.c`).
+
+```c
+void SX1278_init(SX1278_t *module,
+                  uint64_t frequency,
+                  uint8_t power,
+                  uint8_t LoRa_SF,
+                  uint8_t LoRa_BW,
+                  uint8_t LoRa_CR,
+                  uint8_t LoRa_CRC_sum,
+                  uint8_t packetLength);
+```
+
+Initializes SX1278 module with parameters.
+
+**Parameters:**
+- `frequency` - Frequency in Hz (e.g., 433000000 for 433MHz)
+- `power` - Power level: `SX1278_POWER_20DBM`, `_17DBM`, `_14DBM`, `_11DBM`
+- `LoRa_SF` - Spreading factor: `SX1278_LORA_SF_7` through `SX1278_LORA_SF_12`
+- `LoRa_BW` - Bandwidth: `SX1278_LORA_BW_125KHZ`, `_250KHZ`, `_500KHZ`, etc.
+- `LoRa_CR` - Coding rate: `SX1278_LORA_CR_4_5` through `SX1278_LORA_CR_4_8`
+- `LoRa_CRC_sum` - CRC: `SX1278_LORA_CRC_EN` or `SX1278_LORA_CRC_DIS`
+- `packetLength` - Max packet size (1-256 bytes)
+
+**Example:**
+```c
+SX1278_t lora;
+
+// Long range configuration
+SX1278_init(&lora,
+    433000000,                  // 433 MHz
+    SX1278_POWER_20DBM,        // 20dBm (100mW)
+    SX1278_LORA_SF_12,         // SF12 (maximum range)
+    SX1278_LORA_BW_125KHZ,     // 125kHz bandwidth
+    SX1278_LORA_CR_4_8,        // 4/8 coding rate
+    SX1278_LORA_CRC_EN,        // Enable CRC
+    64);                        // 64 byte packets
+```
+
+#### Transmit
+
+```c
+int SX1278_transmit(SX1278_t *module,
+                     uint8_t *txBuf,
+                     uint8_t length,
+                     uint32_t timeout);
+```
+
+Transmits data packet.
+
+**Parameters:**
+- `txBuf` - Data to transmit
+- `length` - Data length (up to packetLength)
+- `timeout` - TX timeout in ms
+
+**Returns:** 1 on success, 0 on timeout
+
+**Example:**
+```c
+uint8_t data[] = "Hello LoRa!";
+int result = SX1278_transmit(&lora, data, strlen((char*)data), 1000);
+if (result == 1) {
+    // Transmission successful
+}
+```
+
+#### Receive
+
+```c
+int SX1278_receive(SX1278_t *module, uint8_t length, uint32_t timeout);
+```
+
+Enters receive mode and waits for packet.
+
+**Parameters:**
+- `length` - Expected packet length
+- `timeout` - RX timeout in ms
+
+**Returns:** 1 if packet received, 0 on timeout
+
+```c
+uint8_t SX1278_available(SX1278_t *module);
+```
+
+Returns number of bytes in receive buffer.
+
+```c
+uint8_t SX1278_read(SX1278_t *module, uint8_t *rxBuf, uint8_t length);
+```
+
+Reads received data.
+
+**Parameters:**
+- `rxBuf` - Buffer to store received data
+- `length` - Maximum bytes to read
+
+**Returns:** Number of bytes read
+
+**Example:**
+```c
+// Start receiving
+if (SX1278_receive(&lora, 64, 5000) == 1) {
+    // Packet received within 5 seconds
+    uint8_t bytes_available = SX1278_available(&lora);
+
+    uint8_t rxbuf[64];
+    uint8_t bytes_read = SX1278_read(&lora, rxbuf, sizeof(rxbuf));
+
+    // Process received data
+    process_packet(rxbuf, bytes_read);
+}
+```
+
+#### Signal Strength
+
+```c
+uint8_t SX1278_RSSI_LoRa(void);
+uint8_t SX1278_RSSI(void);
+```
+
+Returns RSSI (Received Signal Strength Indicator) value.
+
+**Returns:** RSSI value (lower = stronger signal)
+
+#### Power Management
+
+```c
+void SX1278_standby(SX1278_t *module);  // Low power standby
+void SX1278_sleep(SX1278_t *module);    // Sleep mode
+```
+
+### Practical Application
+
+#### Long-Range Telemetry
+
+```c
+#include "lora.h"
+
+SX1278_t lora_module;
+
+void telemetry_lora_init(void) {
+    // Configure for balanced range/speed
+    SX1278_init(&lora_module,
+        433000000,                  // 433 MHz
+        SX1278_POWER_20DBM,        // Maximum power
+        SX1278_LORA_SF_10,         // SF10 (good range)
+        SX1278_LORA_BW_125KHZ,     // 125kHz BW
+        SX1278_LORA_CR_4_5,        // 4/5 CR (less redundancy)
+        SX1278_LORA_CRC_EN,
+        32);                        // 32 byte packets
+}
+
+struct telemetry_packet {
+    float battery_v;
+    float motor_current;
+    int32_t rpm;
+    int16_t temp_motor;
+    int16_t temp_mosfet;
+    uint32_t timestamp;
+};
+
+void send_telemetry(void) {
+    struct telemetry_packet telem;
+
+    telem.battery_v = mc_interface_get_input_voltage_filtered();
+    telem.motor_current = mc_interface_get_tot_current_filtered();
+    telem.rpm = mc_interface_get_rpm();
+    telem.temp_motor = mc_interface_temp_motor_filtered();
+    telem.temp_mosfet = mc_interface_temp_fet_filtered();
+    telem.timestamp = chVTGetSystemTime();
+
+    // Transmit (takes ~500ms at SF10, 125kHz BW)
+    SX1278_transmit(&lora_module, (uint8_t*)&telem, sizeof(telem), 2000);
+}
+
+void receive_commands(void) {
+    // Listen for incoming commands
+    if (SX1278_receive(&lora_module, 32, 100) == 1) {
+        uint8_t cmd_buf[32];
+        uint8_t len = SX1278_read(&lora_module, cmd_buf, sizeof(cmd_buf));
+
+        // Process command packet
+        handle_command(cmd_buf, len);
+    }
+}
+
+// Call periodically
+void lora_task(void) {
+    static uint32_t last_tx = 0;
+    uint32_t now = chVTGetSystemTime();
+
+    // Send telemetry every 5 seconds
+    if (now - last_tx > 5000) {
+        send_telemetry();
+        last_tx = now;
+    }
+
+    // Check for incoming commands
+    receive_commands();
+}
+```
+
+### Range vs Data Rate
+
+**Configuration Trade-offs:**
+
+| SF | BW (kHz) | Data Rate | Range | Air Time (32 bytes) |
+|----|----------|-----------|-------|---------------------|
+| 7  | 125      | ~5.5 kbps | Short | ~56 ms              |
+| 9  | 125      | ~1.8 kbps | Medium| ~185 ms             |
+| 12 | 125      | ~250 bps  | Maximum| ~1400 ms           |
+| 7  | 250      | ~11 kbps  | Short | ~28 ms              |
+| 10 | 125      | ~980 bps  | Long  | ~370 ms             |
+
+**Guidelines:**
+- **Telemetry (low data rate):** SF10-12, 125kHz BW, 4/8 CR
+- **Control (faster updates):** SF7-9, 250kHz BW, 4/5 CR
+- **Maximum range:** SF12, 125kHz BW, 4/8 CR, high power
+- **Urban environment:** Higher SF, lower BW
+
+### Hardware Considerations
+
+**Antenna:**
+- **433MHz:** ~17cm quarter-wave
+- **868MHz:** ~8.6cm quarter-wave
+- **915MHz:** ~8.2cm quarter-wave
+- Use proper 50Ω antenna for best performance
+
+**Power Consumption:**
+- TX at 20dBm: ~120mA
+- RX mode: ~12mA
+- Standby: ~1.5µA
+- Sleep: ~0.2µA
+
+**Regional Restrictions:**
+- **433MHz:** ISM band (most regions)
+- **868MHz:** Europe
+- **915MHz:** North America, Australia
+- Check local regulations for power limits and duty cycle
+
+---
+
+## Summary
+
+The `/driver/` directory provides essential low-level drivers:
+
+**Core Infrastructure:**
+- EEPROM emulation enables persistent configuration storage
+- Timer utilities provide precise timing for control loops
+- LED PWM offers user feedback
+
+**Communication Protocols:**
+- I2C bit-bang for sensors and peripherals
+- SPI bit-bang for encoders and external devices
+
+**Signal Processing:**
+- Servo decoder for RC receiver input
+- PWM servo output for actuators
+
+**Wireless:**
+- NRF24L01+ for short-range, high-speed communication
+- LoRa SX1278 for long-range telemetry
+
+These drivers form the foundation for hardware interaction, enabling the VESC firmware to interface with a wide variety of peripherals and sensors.
