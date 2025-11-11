@@ -937,3 +937,932 @@ mempools_free_mcconf(conf);
 
 **Revision**: 1.0
 **Date**: November 11, 2025
+
+---
+
+# Part 2: HFI Implementation (Low-Speed Sensorless)
+
+## Document Information
+- **File**: Part 2 - HFI (High Frequency Injection)
+- **Added**: November 11, 2025
+- **Prerequisites**: Understanding of Part 1 (BEMF observers)
+
+---
+
+## 1. HFI Overview
+
+### 1.1 What is HFI?
+
+**High Frequency Injection (HFI)** is a sensorless technique for estimating rotor position at **low speeds** where back-EMF is too small for observer-based methods.
+
+### 1.2 Core Principle
+
+HFI exploits **magnetic saliency** in the motor:
+- Inject high-frequency voltage pulses (typ. 2-10 kHz)
+- Measure resulting current response  
+- Current response depends on rotor position (due to anisotropic inductance)
+- Extract position from current measurements
+
+### 1.3 When to Use HFI
+
+```
+Speed Range Chart:
+┌─────────────────────────────────────────────────────────┐
+│ ERPM     │  0  │ 500 │ 1000│ 1500│ 2000│ 5000│ 10000+ │
+├──────────┼─────┼─────┼─────┼─────┼─────┼─────┼────────┤
+│ Observer │  ❌  │  ❌  │  ⚠️  │  ✅  │  ✅  │  ✅  │   ✅   │
+│ HFI      │  ✅  │  ✅  │  ✅  │  ⚠️  │  ❌  │  ❌  │   ❌   │
+└──────────┴─────┴─────┴─────┴─────┴─────┴─────┴────────┘
+           ← HFI optimal →  ← Transition →  ← Observer →
+```
+
+**HFI Configuration Parameter**:
+```c
+motor_conf->foc_sl_erpm_hfi = 1500.0;  // Transition speed (ERPM)
+```
+
+Above this speed: Switch to BEMF observer
+Below this speed: Use HFI
+
+---
+
+## 2. HFI Theory and Motor Saliency
+
+### 2.1 Magnetic Saliency
+
+**Salient motors** have position-dependent inductance:
+
+```
+Motor Cross-Section (Interior PM):
+      
+      N ←─────────── Rotor ─────────→ S
+      │        ╔════════════╗         │
+  d-axis       ║  Magnets   ║      q-axis
+   (hard)      ║   buried   ║       (soft)
+      │        ╚════════════╝         │
+      
+      Ld < Lq              Ld > Lq
+   (magnets block      (iron allows
+     flux path)          flux path)
+```
+
+**Key Equations**:
+```
+Ld = d-axis inductance (along magnet direction)
+Lq = q-axis inductance (perpendicular to magnets)
+
+Saliency ratio: ξ = Ld / Lq
+  Interior PM: ξ ≈ 0.5-0.8 (Ld < Lq)
+  Surface PM:  ξ ≈ 0.95-1.05 (nearly isotropic)
+```
+
+### 2.2 Position-Dependent Inductance
+
+In the stator reference frame, inductance varies with rotor angle:
+
+```
+L(θ) = L_avg + ΔL · cos(2θ)
+
+where:
+  L_avg = (Ld + Lq) / 2
+  ΔL = (Lq - Ld) / 2
+  θ = electrical rotor angle
+```
+
+**Key Insight**: Inductance has **2× electrical frequency** dependence!
+- θ = 0° and θ = 180° look the same (ambiguity problem)
+- Need **ambiguity resolution** algorithm
+
+### 2.3 HFI Voltage Injection
+
+Inject high-frequency voltage vector:
+
+```
+v_inj = V_hfi · cos(ω_hfi · t) · [cos(θ_inj), sin(θ_inj)]
+
+where:
+  V_hfi = injection voltage magnitude (2-10V typical)
+  ω_hfi = injection frequency (2-10 kHz)
+  θ_inj = injection angle (various strategies)
+```
+
+**Current Response**:
+```
+i_response ∝ V_hfi / L(θ_inj)
+
+Since L depends on rotor position, measure i_response → deduce θ_rotor
+```
+
+---
+
+## 3. VESC HFI Modes
+
+VESC implements **5 HFI variants** plus several ambiguity resolution modes:
+
+### 3.1 HFI Mode Enumeration
+
+```c
+typedef enum {
+    FOC_SENSOR_MODE_HFI,         // V1: Rotating injection (8-32 samples/revolution)
+    FOC_SENSOR_MODE_HFI_V2,      // V2: 45° pulse injection
+    FOC_SENSOR_MODE_HFI_V3,      // V3: Like V2 but with V0+V7 sampling
+    FOC_SENSOR_MODE_HFI_V4,      // V4: d-axis pulse injection
+    FOC_SENSOR_MODE_HFI_V5,      // V5: Like V4 but with V0+V7 sampling
+    FOC_SENSOR_MODE_HFI_START,   // Special: HFI for startup only
+} mc_foc_sensor_mode;
+```
+
+**Configuration**: `motor_conf->foc_sensor_mode`
+
+---
+
+### 3.2 HFI V1: Rotating Injection (Original)
+
+**Location**: `motor/mcpwm_foc.c:4879-4906`
+
+#### Algorithm
+
+Injects a **rotating high-frequency voltage vector** and samples current at evenly spaced angles:
+
+```
+Injection Pattern (8 samples):
+     
+         0°
+         ↑
+    315° │ 45°
+       ╲ │ ╱
+  270° ──┼── 90°
+       ╱ │ ╲
+    225° │ 135°
+         ↓
+        180°
+```
+
+**Per-Sample Process**:
+```c
+// Sample N (is_samp_n = false):
+// 1. Inject voltage at angle θ[ind]
+v_inj_alpha = V_hfi * cos(θ[ind])
+v_inj_beta  = V_hfi * sin(θ[ind])
+
+// 2. Measure current at next PWM cycle
+prev_sample = cos(θ[ind]) · i_α + sin(θ[ind]) · i_β
+
+// Sample N+1 (is_samp_n = true):
+// 3. Inject opposite voltage
+v_inj_alpha = -V_hfi * cos(θ[ind])
+v_inj_beta  = -V_hfi * sin(θ[ind])
+
+// 4. Measure current response
+sample_now = cos(θ[ind]) · i_α + sin(θ[ind]) · i_β
+di = sample_now - prev_sample
+
+// 5. Store inductance measurement
+buffer[ind] = (f_sw · di) / V_hfi  // ≈ 1/L at this angle
+
+// 6. Advance to next angle
+ind++
+if (ind >= samples) ind = 0
+```
+
+**FFT Processing**:
+
+Once all samples collected (8, 16, or 32):
+```c
+// Extract DC component (average 1/L)
+fft_bin0(&buffer, &real_bin0, &imag_bin0)
+L_avg = 1.0 / real_bin0
+
+// Extract 2nd harmonic (position-dependent term)
+fft_bin2(&buffer, &real_bin2, &imag_bin2)
+θ_rotor = -atan2(imag_bin2, real_bin2) / 2.0  // Divide by 2!
+```
+
+**Why divide by 2?**: Inductance varies at 2× electrical frequency.
+
+#### Characteristics
+
+| Property | Value |
+|----------|-------|
+| **Injection frequency** | f_sw / samples (e.g., 40kHz/32 = 1.25kHz) |
+| **Sample rate** | Configurable: 8, 16, or 32 samples/cycle |
+| **Pros** | Simple, well-tested, works on most salient motors |
+| **Cons** | Slow (need full rotation of injection), audible noise |
+| **Best for** | General-purpose HFI, motors with good saliency (ξ < 0.85) |
+
+---
+
+### 3.3 HFI V2 & V3: 45° Pulse Injection
+
+**Location**: `motor/mcpwm_foc.c:4814-4878`
+
+#### Algorithm
+
+Instead of rotating injection, uses **pulsed injection** at ±45° relative to estimated d-axis:
+
+```
+Current Rotor Estimate: θ_est
+Injection angles: θ_est ± 45°
+
+     q-axis
+        ↑
+        │   ╱ +45° injection
+        │  ╱
+        │ ╱
+        │╱________> d-axis (θ_est)
+       ╱│
+      ╱ │
+    ╱   │  -45° injection
+        │
+```
+
+**Two-Phase Sampling**:
+
+```c
+Phase 1 (is_samp_n = false):
+  - Inject at θ_est + sign * 45°
+  - Record: prev_sample
+
+Phase 2 (is_samp_n = true):
+  - Inject at θ_est + sign * 45° (same angle)
+  - Measure: sample_now
+  - Compute: di = sample_now - prev_sample
+
+Where: sign = ±1 (alternates based on sign of iq_target)
+```
+
+**Angle Update**:
+```c
+// Calculate position error
+ang_err = sign · ((f_sw · di) / V_hfi - p_v2_v3_inv_avg_half) / p_inv_ld_lq
+
+// Update HFI angle estimate (PI controller)
+foc_hfi_adjust_angle(ang_err, motor, dt)
+```
+
+**Direction Selection**:
+```c
+if (|iq_target| > foc_hfi_hyst) {
+    sign = sign(iq_target)  // Injection direction follows torque
+}
+```
+
+**Difference Between V2 and V3**:
+
+| Feature | HFI_V2 | HFI_V3 |
+|---------|---------|--------|
+| Sampling mode | V0 vector only | V0 + V7 vectors |
+| Current measurement | Single sample | Average of two samples |
+| Noise immunity | Lower | Higher |
+| Phase shunt requirement | 3-shunt or estimated | Requires 3-shunt hardware |
+
+**V0/V7 Vectors**: In space vector modulation:
+- **V0**: All low-side FETs on (000)
+- **V7**: All high-side FETs on (111)
+- Sampling at both provides noise cancellation
+
+#### Characteristics
+
+| Property | Value |
+|----------|-------|
+| **Update rate** | Every 2 PWM cycles (25 µs @ 40kHz FOC) |
+| **Injection frequency** | f_sw / 2 = 20 kHz @ 40kHz FOC |
+| **Pros** | Fast tracking, less audible noise |
+| **Cons** | Requires good saliency, more sensitive to noise |
+| **Best for** | Interior PM motors with strong saliency |
+
+---
+
+### 3.4 HFI V4 & V5: D-Axis Pulse Injection
+
+**Location**: `motor/mcpwm_foc.c:4761-4813`
+
+#### Algorithm
+
+Injects voltage pulses **directly along estimated d-axis**:
+
+```
+Injection Pattern:
+
+     q-axis
+        ↑
+        │
+        │
+        │
+        │________> d-axis
+       →│←        (θ_est)
+    +V │ -V
+       pulse injection
+```
+
+**Process**:
+
+```c
+Phase 1 (is_samp_n = false):
+  // Inject positive d-axis voltage
+  v_d = +V_hfi
+  v_q = 0
+  
+  // Transform to αβ and apply
+  v_α = cos(θ_est) · V_hfi
+  v_β = sin(θ_est) · V_hfi
+  
+  // Measure current in dq frame
+  prev_sample = cos(θ_est) · i_β - sin(θ_est) · i_α  // i_q
+  prev_sample_d = sin(θ_est) · i_β + cos(θ_est) · i_α  // i_d
+
+Phase 2 (is_samp_n = true):
+  // Inject negative d-axis voltage
+  v_d = -V_hfi
+  
+  // Measure current
+  sample_now = current i_q projection
+  sample_d = current i_d projection
+  
+  // Calculate responses
+  di_q = prev_sample - sample_now
+  di_d = prev_sample_d - sample_d
+```
+
+**Angle Update**:
+```c
+// Position error is proportional to q-axis current response
+ang_err = (di_q · f_sw) / (V_hfi · p_inv_ld_lq)
+
+// Update angle
+foc_hfi_adjust_angle(ang_err, motor, dt)
+```
+
+**Why D-Axis?**:
+- Injection perpendicular to torque-producing axis
+- Minimal torque ripple
+- Direct measurement of Ld vs Lq difference
+
+**Difference Between V4 and V5**:
+
+Same as V2 vs V3 distinction:
+
+| Feature | HFI_V4 | HFI_V5 |
+|---------|---------|--------|
+| Sampling | V0 only | V0 + V7 |
+| Noise performance | Lower | Higher |
+
+#### Characteristics
+
+| Property | Value |
+|----------|-------|
+| **Update rate** | Every 2 PWM cycles |
+| **Injection frequency** | f_sw / 2 = 20 kHz |
+| **Pros** | Minimal torque ripple, very fast tracking |
+| **Cons** | Most sensitive to saliency ratio |
+| **Best for** | High-performance applications, strong saliency motors |
+
+---
+
+## 4. HFI Angle Tracking
+
+All HFI variants feed position error into the same tracking algorithm:
+
+### 4.1 foc_hfi_adjust_angle Function
+
+**Location**: `motor/foc_math.c:774-783`
+
+```c
+void foc_hfi_adjust_angle(float ang_err, motor_all_state_t *motor, float dt) {
+    mc_configuration *conf = motor->m_conf;
+    
+    // Limit error magnitude
+    utils_truncate_number_abs(&ang_err, conf->foc_hfi_max_err);
+    
+    // PI controller gains
+    const float gain_int = 4000.0 * conf->foc_hfi_gain;
+    const float gain_int2 = 10.0 * conf->foc_hfi_gain;
+    
+    // Double integrator (velocity tracking)
+    motor->m_hfi.double_integrator += ang_err * gain_int2;
+    utils_truncate_number_abs(&motor->m_hfi.double_integrator, 
+                               fabsf(motor->m_speed_est_fast));
+    
+    // Update angle estimate
+    motor->m_hfi.angle -= dt * (gain_int * ang_err + motor->m_hfi.double_integrator);
+    utils_norm_angle_rad((float*)&motor->m_hfi.angle);
+    
+    motor->m_hfi.ready = true;
+}
+```
+
+### 4.2 Tracking Algorithm Breakdown
+
+This implements a **second-order tracker** (position + velocity):
+
+```
+Block Diagram:
+
+ang_err → [·gain_int2] → [∫] → double_integrator (velocity)
+                                        ↓
+ang_err → [·gain_int] ─────────────> [+] → [·dt] → [∫] → angle
+```
+
+**Physical Interpretation**:
+1. **Proportional term**: `gain_int · ang_err`
+   - Direct correction based on error
+   - Fast response
+
+2. **Double integrator**: Velocity tracking
+   - Accumulates error to estimate speed
+   - Allows HFI to track rotating motors
+   - Clamped to observer speed estimate (prevents runaway)
+
+**Tuning Parameter**:
+```c
+motor_conf->foc_hfi_gain = 1.0;  // Default, range 0.5 - 2.0
+```
+
+Increase gain:
+- ✅ Faster tracking
+- ❌ More noise sensitivity
+
+Decrease gain:
+- ✅ Smoother, more stable
+- ❌ Slower response to load changes
+
+---
+
+## 5. Ambiguity Resolution
+
+### 5.1 The 180° Ambiguity Problem
+
+Due to 2× frequency dependence, HFI sees the same inductance at:
+- θ and θ + 180°
+
+This creates **ambiguity**: Is the rotor at 0° or 180°?
+
+```
+     N
+     ↑
+  ╔══╧══╗  Position A: θ = 0°
+  ║  ↑  ║  (N pointing up)
+  ╚═════╝
+
+     S
+     ↑
+  ╔══╧══╗  Position B: θ = 180°
+  ║  ↓  ║  (S pointing up)
+  ╚═════╝
+  
+  HFI cannot distinguish these without additional information!
+```
+
+### 5.2 Ambiguity Resolution Modes
+
+**Configuration**:
+```c
+typedef enum {
+    FOC_AMB_MODE_SIX_VECTOR,      // FFT-based (classic)
+    FOC_AMB_MODE_D_SINGLE_PULSE,  // Single D-axis pulse
+    FOC_AMB_MODE_D_DOUBLE_PULSE,  // Dual D-axis pulse
+} mc_foc_hfi_amb_mode;
+```
+
+---
+
+### 5.3 Six-Vector Ambiguity Resolution
+
+**Location**: `motor/mcpwm_foc.c:4187-4235`
+
+Uses FFT analysis of HFI V1 rotating injection:
+
+#### Algorithm
+
+```c
+// After collecting full HFI buffer:
+fft_bin1(buffer, &real_bin1, &imag_bin1)  // 1st harmonic
+fft_bin2(buffer, &real_bin2, &imag_bin2)  // 2nd harmonic
+
+// Extract angles
+angle_bin_1 = -atan2(imag_bin1, real_bin1)        // 1× frequency (saturation)
+angle_bin_2 = -atan2(imag_bin2, real_bin2) / 2.0  // 2× frequency (saliency)
+
+// Check alignment
+if (|angle_bin_2 - angle_bin_1| > 90°) {
+    flip_cnt++
+}
+```
+
+**Decision Logic** (during startup, first N samples):
+```c
+if (flip_cnt >= foc_hfi_start_samples / 2) {
+    // Angles are misaligned → flip 180°
+    angle_bin_2 += π
+}
+```
+
+**Why This Works**:
+- **1st harmonic** (angle_bin_1): Due to magnetic saturation, aligns with true rotor position
+- **2nd harmonic** (angle_bin_2): From saliency, has 180° ambiguity
+- Compare the two → resolve ambiguity
+
+**Configuration**:
+```c
+motor_conf->foc_hfi_start_samples = 32;  // Samples to collect before resolving
+```
+
+#### Characteristics
+
+| Property | Value |
+|----------|-------|
+| **Resolution time** | ~32-64 samples (0.8-1.6ms @ 40kHz) |
+| **Reliability** | High (uses saturation + saliency) |
+| **Motor requirements** | Must have some saturation nonlinearity |
+| **Best for** | HFI V1 (rotating injection) |
+
+---
+
+### 5.4 D-Axis Pulse Ambiguity Resolution
+
+**Location**: `motor/mcpwm_foc.c:4308-4393`
+
+For ambiguity resolution with HFI V2-V5 modes.
+
+#### Algorithm Phases
+
+**Phase 1 (20% of start_samples)**: Idle
+```c
+id_target = 0
+// Just initialize, no decision yet
+```
+
+**Phase 2 (20-50% of start_samples)**: Positive D-current
+```c
+id_target = +foc_hfi_amb_current  // e.g., +5A
+// Apply current in estimated d-axis
+// Measure response
+```
+
+**Phase 3 (50-70%)**: Idle
+```c
+id_target = 0
+```
+
+**Phase 4 (70-100%)**: Negative D-current
+```c
+id_target = -foc_hfi_amb_current  // e.g., -5A
+// Apply current in opposite direction
+// Compare response with Phase 2
+```
+
+**Decision**:
+```c
+// If responses are symmetric → correct orientation
+// If asymmetric → flip 180°
+if (asymmetry_detected) {
+    angle_new = hfi.angle + π
+    hfi.angle = angle_new
+}
+```
+
+**Why This Works**:
+- D-axis current interacts with permanent magnets
+- Pushing "with" magnets vs "against" magnets gives different response
+- Asymmetry indicates wrong polarity
+
+#### Configuration
+
+```c
+motor_conf->foc_hfi_amb_current = 5.0;        // Test current (A)
+motor_conf->foc_hfi_start_samples = 100;      // Total samples for resolution
+```
+
+#### Characteristics
+
+| Property | Value |
+|----------|-------|
+| **Resolution time** | 100-200 samples (2.5-5ms @ 40kHz) |
+| **Motor current** | Requires brief current pulse (configurable) |
+| **Best for** | HFI V2-V5, interior PM motors |
+
+---
+
+## 6. HFI Configuration Parameters
+
+### 6.1 Core Parameters
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `foc_sensor_mode` | enum | - | HFI/HFI_V2/V3/V4/V5 | HFI mode selection |
+| `foc_hfi_voltage_start` | float | 5.0 | 2-15V | Injection voltage at startup |
+| `foc_hfi_voltage_run` | float | 3.0 | 2-15V | Injection voltage during run |
+| `foc_hfi_voltage_max` | float | 10.0 | 2-20V | Max injection voltage at high current |
+| `foc_hfi_samples` | enum | 16 | 8/16/32 | Samples per HFI cycle (V1 only) |
+| `foc_hfi_gain` | float | 1.0 | 0.5-2.0 | Tracking loop gain |
+| `foc_hfi_max_err` | float | 0.3 | 0.1-1.0 | Max angle error per update (rad) |
+| `foc_sl_erpm_hfi` | float | 1500 | 500-3000 | Transition speed to observer |
+| `foc_hfi_reset_erpm` | float | 200 | 50-500 | Speed below which HFI resets |
+
+### 6.2 Ambiguity Resolution Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `foc_hfi_amb_mode` | enum | SIX_VECTOR | Ambiguity resolution method |
+| `foc_hfi_start_samples` | int | 32 | Samples before ambiguity resolved |
+| `foc_hfi_amb_current` | float | 5.0 | Test current for D-pulse methods (A) |
+
+### 6.3 Advanced Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `foc_hfi_obs_ovr_sec` | float | Observer override duration at speed (sec) |
+| `foc_hfi_hyst` | float | Hysteresis for V2/V3 direction switching |
+
+---
+
+## 7. HFI Execution Flow
+
+### 7.1 ISR Integration
+
+```
+FOC ISR (40 kHz)
+  └─ control_current()                [mcpwm_foc.c:4506]
+      ├─ Check: do_hfi = (HFI mode && speed < erpm_hfi)
+      │
+      ├─ if (do_hfi):
+      │   ├─ CURRENT_FILTER_OFF()     // Disable low-pass filter
+      │   ├─ Inject HFI voltage       [mcpwm_foc.c:4731-4933]
+      │   │   ├─ Calculate injection voltage
+      │   │   ├─ Measure current response
+      │   │   └─ Update mod_alpha/beta with injection
+      │   └─ Store sample for processing
+      │
+      └─ else:
+          └─ CURRENT_FILTER_ON()      // Re-enable filtering
+```
+
+### 7.2 Background Processing
+
+```
+HFI Thread (2 kHz)
+  └─ hfi_update()                     [mcpwm_foc.c:4147]
+      ├─ if (rpm > erpm_hfi):
+      │   └─ Reset HFI to observer angle
+      │
+      ├─ if (HFI_V1 && buffer_ready):
+      │   ├─ FFT analysis
+      │   ├─ Extract angle_bin_2
+      │   ├─ Ambiguity check (if not resolved)
+      │   └─ Update hfi.angle
+      │
+      ├─ if (HFI_V2-V5):
+      │   └─ Angle updated in ISR (foc_hfi_adjust_angle)
+      │
+      └─ if (Ambiguity mode D_PULSE):
+          └─ Manage id_target for test currents
+```
+
+---
+
+## 8. HFI Tuning Guide
+
+### 8.1 Step-by-Step Procedure
+
+#### Step 1: Verify Motor Saliency
+
+HFI **requires** magnetic saliency. Check:
+
+```
+Run VESC Tool detection:
+FOC → Run Detection → Measure RL
+
+Check: foc_motor_ld_lq_diff
+
+If |ld_lq_diff| < 5 µH:
+  → Motor may not have enough saliency for HFI
+  → Try anyway, but may not work well
+  
+Ideal: |ld_lq_diff| > 10 µH
+```
+
+#### Step 2: Choose HFI Mode
+
+| Motor Type | Recommended Mode |
+|------------|------------------|
+| First-time setup | **HFI (V1)** - Most robust |
+| Interior PM, strong saliency | **HFI_V4** or **HFI_V5** - Best performance |
+| Noisy environment | **HFI_V3** or **HFI_V5** - V0+V7 sampling |
+| Surface PM (weak saliency) | **HFI (V1)** - Only option that might work |
+
+#### Step 3: Configure Injection Voltage
+
+```c
+// Start conservative
+motor_conf->foc_hfi_voltage_start = 4.0;  // Startup voltage
+motor_conf->foc_hfi_voltage_run = 3.0;    // Running voltage
+motor_conf->foc_hfi_voltage_max = 8.0;    // Max at high current
+```
+
+**Tuning**:
+- **Too low**: HFI won't detect position (motor stutters)
+- **Too high**: Audible noise, excess heating
+- Increase until motor starts smoothly
+
+#### Step 4: Configure Ambiguity Resolution
+
+```c
+motor_conf->foc_hfi_amb_mode = FOC_AMB_MODE_SIX_VECTOR;
+motor_conf->foc_hfi_start_samples = 32;
+```
+
+For HFI V2-V5 with strong saliency:
+```c
+motor_conf->foc_hfi_amb_mode = FOC_AMB_MODE_D_SINGLE_PULSE;
+motor_conf->foc_hfi_amb_current = 5.0;  // 5-10A typical
+```
+
+#### Step 5: Test Startup
+
+```
+1. Set very low current limit (5-10A) for safety
+2. Apply small throttle
+3. Observe:
+   ✅ Motor starts smoothly → Good!
+   ❌ Motor stutters → Increase hfi_voltage_start
+   ❌ Motor spins backward → Ambiguity not resolved, check amb_mode
+   ❌ Motor oscillates → Decrease hfi_gain
+```
+
+#### Step 6: Tune Transition Speed
+
+```c
+motor_conf->foc_sl_erpm_hfi = 1500.0;  // Transition to observer
+```
+
+Test:
+1. Accelerate slowly from standstill
+2. Listen for transition point (may hear tone change)
+3. If rough transition:
+   - Increase `foc_sl_erpm_hfi` (transition later)
+   - Check observer tuning (Part 1)
+
+---
+
+### 8.2 Common Issues
+
+| Symptom | Likely Cause | Solution |
+|---------|--------------|----------|
+| Won't start | Voltage too low | Increase `foc_hfi_voltage_start` |
+| Starts backward | Ambiguity error | Check ambiguity mode, increase `start_samples` |
+| Stutters at low speed | Poor tracking | Increase `foc_hfi_gain` |
+| Oscillates/unstable | Gain too high | Decrease `foc_hfi_gain` |
+| Loud whine | Injection voltage too high | Decrease `foc_hfi_voltage_run` |
+| Rough transition | Speed mismatch | Adjust `foc_sl_erpm_hfi` |
+| Works then fails | Not enough saliency | Check `ld_lq_diff`, may need encoder |
+
+---
+
+## 9. Performance Characteristics
+
+### 9.1 Speed vs Mode
+
+| Mode | Min Speed | Max Speed | Update Rate | Noise Level |
+|------|-----------|-----------|-------------|-------------|
+| HFI V1 | 0 ERPM | ~1500 | f_sw/samples | Medium |
+| HFI V2 | 0 ERPM | ~2000 | f_sw/2 | Medium-Low |
+| HFI V3 | 0 ERPM | ~2000 | f_sw/2 | Low |
+| HFI V4 | 0 ERPM | ~2500 | f_sw/2 | Lowest |
+| HFI V5 | 0 ERPM | ~2500 | f_sw/2 | Lowest |
+
+### 9.2 CPU Usage
+
+| Mode | CPU Cycles/Update | Relative Cost |
+|------|-------------------|---------------|
+| HFI V1 (8 samples) | ~150 | 1.0× |
+| HFI V1 (32 samples) | ~400 | 2.7× |
+| HFI V2/V3 | ~180 | 1.2× |
+| HFI V4/V5 | ~200 | 1.3× |
+
+**At 40 kHz**: All modes <1.5% CPU
+
+### 9.3 Saliency Requirements
+
+| Saliency Ratio (ξ = Ld/Lq) | HFI Performance |
+|----------------------------|-----------------|
+| ξ < 0.7 (strong) | ✅ Excellent, all modes work |
+| 0.7 < ξ < 0.85 | ✅ Good, V1/V4/V5 recommended |
+| 0.85 < ξ < 0.95 | ⚠️ Marginal, V1 only, high voltage |
+| ξ > 0.95 (weak) | ❌ HFI may not work, needs encoder |
+
+---
+
+## 10. HFI Hardware Requirements
+
+### 10.1 Current Sensing
+
+**Critical**: HFI needs **accurate, low-latency current measurements**
+
+Requirements:
+- **Bandwidth**: >20 kHz for HFI injection frequency
+- **Noise**: <0.1A RMS at measurement point
+- **Phase shift**: <5° at injection frequency
+
+**Hardware Options**:
+
+| Configuration | HFI Modes Supported | Notes |
+|---------------|---------------------|-------|
+| 3-shunt + filters OFF | V1, V2, V3, V4, V5 | Best performance |
+| 3-shunt + filters ON | V1 only | Filters attenuate HFI signal |
+| 2-shunt (estimated phases) | V1, V2, V4 | V3/V5 won't work |
+
+**VESC Control**: Filters disabled automatically in `control_current()`:
+```c
+if (do_hfi) {
+    CURRENT_FILTER_OFF();  // Bypass hardware low-pass filters
+}
+```
+
+### 10.2 PWM Frequency
+
+Higher PWM frequency = better HFI performance:
+
+| FOC Frequency | HFI Injection | Performance |
+|---------------|---------------|-------------|
+| 20 kHz | 10 kHz | ⚠️ Marginal |
+| 30 kHz | 15 kHz | ✅ Good |
+| 40 kHz | 20 kHz | ✅ Excellent |
+| 50 kHz+ | 25 kHz+ | ✅ Best |
+
+**Trade-off**: Higher frequency → More switching losses
+
+---
+
+## 11. Code Reference
+
+### 11.1 Key Files
+
+| File | HFI-Related Code |
+|------|------------------|
+| `motor/mcpwm_foc.c` | HFI injection (4731-4933), ambiguity resolution (4187-4393) |
+| `motor/foc_math.c` | `foc_hfi_adjust_angle()` tracking function |
+| `datatypes.h` | HFI configuration structures, enums |
+
+### 11.2 Key Functions
+
+| Function | Location | Purpose |
+|----------|----------|---------|
+| `control_current()` | mcpwm_foc.c:4506 | Main FOC loop, HFI injection |
+| `hfi_update()` | mcpwm_foc.c:4147 | Background HFI processing |
+| `foc_hfi_adjust_angle()` | foc_math.c:774 | Angle tracking PI controller |
+
+### 11.3 HFI State Variables
+
+```c
+// In motor_all_state_t
+typedef struct {
+    struct {
+        float angle;                 // Estimated rotor angle (rad)
+        float double_integrator;     // Velocity estimate (rad/s)
+        bool ready;                  // HFI data available
+        bool is_samp_n;              // Injection phase toggle
+        int ind;                     // Sample index
+        int samples;                 // Total samples (8/16/32)
+        int table_fact;              // FFT table scaling
+        float buffer[64];            // Inductance samples
+        float buffer_current[64];    // Current samples
+        int est_done_cnt;            // Ambiguity resolution counter
+        int flip_cnt;                // Polarity flip counter
+        // V2/V3/V4/V5 specific:
+        float prev_sample;           // Previous current measurement
+        float prev_sample_d;         // Previous d-axis current
+        float sin_last, cos_last;    // Last injection angle (V2/V3)
+        float sign_last_sample;      // Injection direction (V2/V3)
+        // FFT function pointers:
+        void (*fft_bin0_func)(float *data, float *real, float *imag);
+        void (*fft_bin1_func)(float *data, float *real, float *imag);
+        void (*fft_bin2_func)(float *data, float *real, float *imag);
+    } m_hfi;
+} motor_all_state_t;
+```
+
+---
+
+## 12. Summary of Part 2
+
+**What We Covered**:
+- ✅ HFI theory: Magnetic saliency and position-dependent inductance
+- ✅ 5 HFI modes: V1 (rotating), V2/V3 (45° pulse), V4/V5 (d-axis pulse)
+- ✅ Ambiguity resolution: Six-vector and D-axis pulse methods
+- ✅ Angle tracking: Double-integrator PI controller
+- ✅ Configuration parameters and tuning procedures
+- ✅ Performance characteristics and hardware requirements
+
+**What's Next**:
+- **Part 3**: Hardware integration details
+  - Analog switch control (CURRENT_FILTER_OFF/ON)
+  - Phase filter hardware
+  - Sampling modes (V0/V7)
+  - Integration with VESC hardware variants
+
+---
+
+## Document End (Part 2 of 3)
+
+**Revision**: 1.0
+**Date**: November 11, 2025
