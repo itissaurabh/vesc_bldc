@@ -822,3 +822,588 @@ if (m_sample_mode != DEBUG_SAMPLING_OFF) {
 
 ---
 
+## Safety Thread
+
+### Timeout Thread
+
+**File:** `timeout.c:192-276`
+**Created at:** `timeout.c:83`
+**Priority:** `NORMALPRIO` (64)
+**Execution Rate:** 100 Hz (10ms period)
+**Stack Size:** 256 bytes
+
+#### Purpose
+Provides safety watchdog functionality by monitoring for communication timeouts, kill switch activation, and thread health. Automatically applies brake current when timeout occurs.
+
+#### Thread Configuration
+```c
+static THD_WORKING_AREA(timeout_thread_wa, 256);
+chThdCreateStatic(timeout_thread_wa, sizeof(timeout_thread_wa),
+                  NORMALPRIO, timeout_thread, NULL);
+```
+
+#### Call Flow
+
+**Entry Point:** `timeout_thread()`
+
+```
+timeout_thread()
+  ├─ chRegSetThreadName("Timeout")
+  │
+  └─ for(;;)  // Infinite loop
+      │
+      ├─ Check kill switch based on mode
+      │  ├─ switch (timeout_kill_sw_mode)
+      │  │   │
+      │  │   ├─ case KILL_SW_MODE_PPM_LOW:
+      │  │   │   └─ kill_sw = !palReadPad(HW_ICU_GPIO, HW_ICU_PIN)
+      │  │   │       └─ [Read PPM input pin, active low]
+      │  │   │
+      │  │   ├─ case KILL_SW_MODE_PPM_HIGH:
+      │  │   │   └─ kill_sw = palReadPad(HW_ICU_GPIO, HW_ICU_PIN)
+      │  │   │       └─ [Read PPM input pin, active high]
+      │  │   │
+      │  │   ├─ case KILL_SW_MODE_ADC2_LOW:
+      │  │   │   └─ kill_sw = ADC_VOLTS(ADC_IND_EXT2) < 1.65
+      │  │   │       └─ [Read ADC2, trigger below 1.65V]
+      │  │   │
+      │  │   ├─ case KILL_SW_MODE_ADC2_HIGH:
+      │  │   │   └─ kill_sw = ADC_VOLTS(ADC_IND_EXT2) > 1.65
+      │  │   │       └─ [Read ADC2, trigger above 1.65V]
+      │  │   │
+      │  │   └─ default:
+      │  │       └─ kill_sw = false
+      │  │
+      │  └─ Check external kill switch override
+      │      └─ if (kill_sw_ext_set)
+      │          └─ kill_sw = true
+      │             └─ [Can be set via commands or LispBM]
+      │
+      ├─ Check for timeout condition
+      │  ├─ timeout_elapsed = chVTTimeElapsedSinceX(last_update_time) > MS2ST(timeout_msec)
+      │  └─ timeout_active = (timeout_msec != 0) && timeout_elapsed
+      │
+      ├─ Handle timeout or kill switch activation
+      │  └─ if (kill_sw || timeout_active)
+      │      │
+      │      ├─ Release motor override (first occurrence only)
+      │      │  └─ if (!has_timeout && !kill_sw_active)
+      │      │      └─ mc_interface_release_motor_override()
+      │      │         └─ [Clear any manual motor control override]
+      │      │
+      │      ├─ Unlock motor control
+      │      │  └─ mc_interface_unlock()
+      │      │     └─ [Allow brake command even if locked]
+      │      │
+      │      ├─ Apply brake to motor 1
+      │      │  ├─ mc_interface_select_motor_thread(1)
+      │      │  └─ mc_interface_set_brake_current(timeout_brake_current)
+      │      │
+      │      ├─ Apply brake to motor 2 (if dual motor)
+      │      │  ├─ mc_interface_select_motor_thread(2)
+      │      │  └─ mc_interface_set_brake_current(timeout_brake_current)
+      │      │
+      │      ├─ Handle kill switch vs timeout differently
+      │      │  ├─ if (kill_sw)
+      │      │  │   └─ mc_interface_ignore_input_both(20)
+      │      │  │       └─ [Ignore all inputs for 20 iterations (200ms)]
+      │      │  │           [Prevents immediate restart]
+      │      │  └─ else
+      │      │      └─ has_timeout = true
+      │      │         └─ [Flag timeout condition]
+      │      │
+      │      └─ [Motors now braking]
+      │
+      ├─ Clear timeout flag when recovered
+      │  └─ else
+      │      └─ has_timeout = false
+      │
+      ├─ Update kill switch status
+      │  └─ kill_sw_active = kill_sw
+      │
+      ├─ Monitor critical thread health (watchdog feeding)
+      │  ├─ bool threads_ok = true
+      │  │
+      │  ├─ Check FOC thread health
+      │  │  └─ if (feed_counter[THREAD_MCPWM] < MIN_THREAD_ITERATIONS)
+      │  │      └─ threads_ok = false
+      │  │         └─ [FOC ISR must report at least 1 iteration per 10ms]
+      │  │
+      │  ├─ Check CAN thread health (if enabled)
+      │  │  └─ if (feed_counter[THREAD_CANBUS] < MIN_THREAD_ITERATIONS)
+      │  │      └─ threads_ok = false
+      │  │         └─ [CAN RX must process at least 1 message per 10ms]
+      │  │
+      │  └─ Reset feed counters for next iteration
+      │      └─ for (i = 0; i < MAX_THREADS_MONITOR; i++)
+      │          └─ feed_counter[i] = 0
+      │
+      ├─ Feed or starve watchdog based on thread health
+      │  ├─ if (threads_ok == true)
+      │  │   └─ IWDG_ReloadCounter()
+      │  │       ├─ [Reload independent watchdog timer]
+      │  │       └─ [Must be called every 12ms max]
+      │  │
+      │  └─ else
+      │      └─ [Don't feed watchdog]
+      │         ├─ [Watchdog will trigger reset after 12ms]
+      │         └─ [System will boot with FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET]
+      │
+      └─ chThdSleepMilliseconds(10)  // 100 Hz rate
+```
+
+#### Thread Health Monitoring
+
+**How threads report health:**
+```c
+// From FOC ISR (runs at 10-40 kHz):
+void mcpwm_foc_adc_int_handler(void) {
+    // ... FOC algorithm execution ...
+    timeout_feed_WDT(THREAD_MCPWM);  // Increment feed counter
+}
+
+// From CAN RX thread:
+while (msg_available) {
+    // ... process CAN message ...
+    timeout_feed_WDT(THREAD_CANBUS);  // Increment feed counter
+}
+```
+
+#### Timeout Reset
+
+**How timeout is reset (from application threads):**
+```c
+// PPM thread resets timeout on valid pulse:
+static void servodec_func(void) {
+    timeout_reset();  // Updates last_update_time
+}
+
+// ADC thread resets on valid input
+// Commands reset on valid packet received
+```
+
+#### Independent Watchdog (IWDG) Configuration
+
+**Initialization (from timeout_init):**
+```c
+timeout_init()
+  ├─ Configure IWDG
+  │  ├─ IWDG_SetPrescaler(IWDG_Prescaler_4)
+  │  │   └─ [LSI clock / 4]
+  │  │
+  │  ├─ IWDG_SetReload(140)
+  │  │   └─ [12ms timeout @ 47kHz LSI]
+  │  │       [33ms timeout @ 17kHz LSI]
+  │  │       [Accounts for LSI frequency variation]
+  │  │
+  │  └─ IWDG_Enable()
+  │      └─ [Watchdog now running, must be fed every 12ms]
+  │
+  └─ Create timeout thread
+```
+
+#### Key ChibiOS APIs Used
+- `chRegSetThreadName()` - Register thread name
+- `chVTGetSystemTimeX()` - Get current system time
+- `chVTTimeElapsedSinceX()` - Calculate elapsed time
+- `MS2ST()` - Convert milliseconds to system ticks
+- `chThdSleepMilliseconds()` - Periodic sleep
+- `palReadPad()` - Read GPIO pin for kill switch
+
+#### Function Calls Summary
+1. `palReadPad()` - Read kill switch GPIO
+2. `ADC_VOLTS()` - Read kill switch ADC
+3. `chVTTimeElapsedSinceX()` - Check timeout elapsed
+4. `mc_interface_release_motor_override()` - Clear overrides
+5. `mc_interface_unlock()` - Unlock control
+6. `mc_interface_select_motor_thread()` - Select motor
+7. `mc_interface_set_brake_current()` - Apply brake
+8. `mc_interface_ignore_input_both()` - Ignore inputs
+9. `IWDG_ReloadCounter()` - Feed watchdog
+
+#### Kill Switch Modes
+- `KILL_SW_MODE_DISABLED` - No kill switch
+- `KILL_SW_MODE_PPM_LOW` - PPM pin low = kill
+- `KILL_SW_MODE_PPM_HIGH` - PPM pin high = kill
+- `KILL_SW_MODE_ADC2_LOW` - ADC2 < 1.65V = kill
+- `KILL_SW_MODE_ADC2_HIGH` - ADC2 > 1.65V = kill
+
+#### Timing Characteristics
+- **Period:** 10ms (100 Hz)
+- **Watchdog Timeout:** 12ms minimum, 33ms maximum
+- **Timeout Resolution:** 10ms (thread period)
+- **CPU Usage:** Minimal (~0.1%)
+- **Response Time:** <10ms to timeout/kill switch
+
+#### Critical Safety Features
+
+**1. Dual Safety Mechanisms:**
+- **Software Timeout:** Detects communication loss
+- **Hardware Watchdog:** Detects software hang/crash
+
+**2. Thread Health Monitoring:**
+- Ensures critical threads (FOC ISR, CAN) are running
+- Automatic reset if thread stops responding
+- Prevents silent failures
+
+**3. Kill Switch:**
+- Hardware-level emergency stop
+- Multiple input modes (GPIO, ADC)
+- Ignores all inputs for 200ms after activation
+
+**4. Graceful Degradation:**
+- Applies configurable brake current (not full brake)
+- Can be configured for zero brake (coast to stop)
+- Smooth deceleration prevents mechanical stress
+
+#### Notes
+- **Watchdog must be fed every 12ms** - timeout thread runs at 10ms
+- Thread health monitoring prevents silent failures
+- Kill switch has higher priority than timeout
+- Brake current is configurable (0-max)
+- Can trigger from multiple sources:
+  - Communication timeout (PPM/ADC/UART/CAN)
+  - Kill switch activation
+  - Thread failure (automatic reset)
+- External kill switch can be set via commands/LispBM
+- Used for:
+  - Emergency stop
+  - Range limiting (geofencing)
+  - Remote shutdown
+  - Failsafe operation
+
+---
+
+## Application Threads
+
+Application threads implement different control input methods (RC, throttle, pedal assist, Wii controller). They all follow a similar pattern: read input → process → send motor command.
+
+### PPM Thread
+
+**File:** `applications/app_ppm.c:107-564`
+**Created at:** `app_ppm.c:72` via `app_ppm_start()`
+**Priority:** `NORMALPRIO` (64)
+**Execution Rate:** Event-driven + 100 Hz timeout check
+**Stack Size:** 512 bytes (in RAM4 for performance)
+
+#### Purpose
+Processes RC receiver PPM (Pulse Position Modulation) signals for motor control. Supports multiple control modes including current, duty cycle, speed, and position control.
+
+#### Thread Configuration
+```c
+__attribute__((section(".ram4"))) static THD_WORKING_AREA(ppm_thread_wa, 512);
+static thread_t *ppm_tp;
+chThdCreateStatic(ppm_thread_wa, sizeof(ppm_thread_wa),
+                  NORMALPRIO, ppm_thread, NULL);
+```
+
+#### Call Flow
+
+**Entry Point:** `ppm_thread()`
+
+```
+ppm_thread()
+  ├─ chRegSetThreadName("APP_PPM")
+  │
+  ├─ ppm_tp = chThdGetSelfX()
+  │  └─ [Store thread pointer for ISR signaling]
+  │
+  ├─ Initialize servo decoder
+  │  ├─ servodec_set_pulse_options(pulse_start, pulse_end, median_filter)
+  │  │  └─ [Configure: 1ms-2ms typical, median filter for noise]
+  │  │
+  │  └─ servodec_init(servodec_func)
+  │      ├─ [Setup timer input capture on PPM pin]
+  │      └─ [Register ISR callback: servodec_func]
+  │
+  ├─ is_running = true
+  │
+  └─ for(;;)  // Main loop
+      │
+      ├─ Wait for PPM pulse or timeout
+      │  └─ chEvtWaitAnyTimeout((eventmask_t)1, MS2ST(2))
+      │      ├─ [Blocks until signaled by servodec ISR]
+      │      └─ [Or 2ms timeout (500 Hz max check rate)]
+      │
+      ├─ Check for stop request
+      │  └─ if (stop_now)
+      │      └─ return  // Exit thread
+      │
+      ├─ Handle PPM pulse received
+      │  └─ if (ppm_rx)
+      │      ├─ ppm_rx = false
+      │      └─ timeout_reset()
+      │         └─ [Reset watchdog - valid signal received]
+      │
+      ├─ Read motor configuration
+      │  ├─ mcconf = mc_interface_get_configuration()
+      │  └─ rpm_now = mc_interface_get_rpm()
+      │
+      ├─ Read PPM servo value
+      │  ├─ servo_val = servodec_get_servo(0)
+      │  │   ├─ [Returns -1.0 to +1.0]
+      │  │   └─ [Based on pulse width: 1ms=-1, 1.5ms=0, 2ms=+1]
+      │  │
+      │  └─ if (ppm_detached)
+      │      └─ servo_val = ppm_override
+      │         └─ [LispBM can override PPM input]
+      │
+      ├─ Convert to milliseconds for mode-specific mapping
+      │  └─ servo_ms = utils_map(servo_val, -1.0, 1.0, pulse_start, pulse_end)
+      │
+      ├─ Map pulse width based on control type
+      │  └─ switch (ctrl_type)
+      │      │
+      │      ├─ case PPM_CTRL_TYPE_CURRENT_NOREV:
+      │      ├─ case PPM_CTRL_TYPE_DUTY_NOREV:
+      │      ├─ case PPM_CTRL_TYPE_PID_NOREV:
+      │      ├─ case PPM_CTRL_TYPE_PID_POSITION_360:
+      │      │   ├─ input_val = servo_val
+      │      │   ├─ servo_val += 1.0  // Convert [-1,1] to [0,2]
+      │      │   └─ servo_val /= 2.0  // Then to [0,1]
+      │      │       └─ [No reverse - full range is forward only]
+      │      │
+      │      └─ default:  // Bidirectional modes
+      │          ├─ if (servo_ms < pulse_center)
+      │          │   └─ servo_val = map(servo_ms, pulse_start, pulse_center, -1.0, 0.0)
+      │          │       └─ [Below center = reverse/brake]
+      │          └─ else
+      │              └─ servo_val = map(servo_ms, pulse_center, pulse_end, 0.0, 1.0)
+      │                  └─ [Above center = forward]
+      │
+      ├─ Check if output is disabled
+      │  └─ if (app_is_output_disabled())
+      │      └─ continue  // Skip motor control but keep reading input
+      │
+      ├─ Handle timeout condition
+      │  └─ if (timeout_has_timeout() || servodec_get_time_since_update() > timeout)
+      │      ├─ pulses_without_power = 0
+      │      ├─ servoError = true
+      │      ├─ timeoutCurrent = timeout_get_brake_current()
+      │      │
+      │      ├─ Apply brake to local motor
+      │      │  └─ mc_interface_set_brake_current(timeoutCurrent)
+      │      │
+      │      ├─ Apply brake to CAN motors (if multi-ESC)
+      │      │  └─ if (config.multi_esc)
+      │      │      └─ for each CAN motor
+      │      │          └─ comm_can_set_current_brake(id, timeoutCurrent)
+      │      │
+      │      └─ continue  // Skip normal processing
+      │
+      ├─ Handle fault condition (if safe start enabled)
+      │  └─ if (mc_interface_get_fault() != FAULT_CODE_NONE && config.safe_start)
+      │      └─ pulses_without_power = 0
+      │         └─ [Reset safe start counter]
+      │
+      ├─ Apply deadband
+      │  └─ utils_deadband(&servo_val, config.hyst, 1.0)
+      │      └─ [Creates "dead zone" around neutral]
+      │          [Prevents drift from slightly off-center stick]
+      │
+      ├─ Apply throttle curve
+      │  └─ servo_val = utils_throttle_curve(servo_val, exp, exp_brake, mode)
+      │      ├─ [Exponential curve for finer control at low throttle]
+      │      ├─ exp=0.0: Linear
+      │      ├─ exp>0.0: More power at low end
+      │      └─ exp<0.0: Less power at low end (smoother)
+      │
+      ├─ Apply ramping (acceleration/deceleration limiting)
+      │  ├─ dt = ST2MS(chVTTimeElapsedSinceX(last_time)) / 1000.0
+      │  ├─ last_time = chVTGetSystemTimeX()
+      │  │
+      │  ├─ Select ramp time based on direction
+      │  │  └─ ramp_time = (|servo_val| > |servo_val_ramp|)
+      │  │                  ? ramp_time_pos  // Accelerating
+      │  │                  : ramp_time_neg  // Decelerating
+      │  │
+      │  └─ if (ramp_time > 0.01)
+      │      ├─ ramp_step = dt / ramp_time
+      │      ├─ utils_step_towards(&servo_val_ramp, servo_val, ramp_step)
+      │      └─ servo_val = servo_val_ramp
+      │         └─ [Smooth transition limited by ramp time]
+      │
+      ├─ Process control type and send motor command
+      │  └─ switch (config.ctrl_type)
+      │      │
+      │      ├─ case PPM_CTRL_TYPE_CURRENT:
+      │      ├─ case PPM_CTRL_TYPE_CURRENT_NOREV:
+      │      │   ├─ current_mode = true
+      │      │   │
+      │      │   ├─ Calculate current based on direction
+      │      │   │  └─ if ((servo_val >= 0 && rpm_now >= 0) || (servo_val < 0 && rpm_now <= 0))
+      │      │   │      └─ current = servo_val * mcconf->lo_current_max  // Accelerate
+      │      │   │      else
+      │      │   │          └─ current = servo_val * |mcconf->lo_current_min|  // Brake
+      │      │   │
+      │      │   └─ if (|servo_val| < 0.001)
+      │      │       └─ pulses_without_power++
+      │      │          └─ [Count neutral position for safe start]
+      │      │
+      │      ├─ case PPM_CTRL_TYPE_CURRENT_BRAKE_REV_HYST:
+      │      │   ├─ [Complex mode with direction hysteresis]
+      │      │   ├─ Implements soft reverse with brake zone
+      │      │   ├─ force_brake flag prevents instant direction change
+      │      │   ├─ Requires stopping below threshold RPM before reverse
+      │      │   └─ idle_once counter ensures full stop before direction change
+      │      │
+      │      ├─ case PPM_CTRL_TYPE_DUTY:
+      │      ├─ case PPM_CTRL_TYPE_DUTY_NOREV:
+      │      │   ├─ if (|servo_val| < 0.001)
+      │      │   │   └─ pulses_without_power++
+      │      │   │
+      │      │   └─ if (!(pulses_without_power < MIN && safe_start))
+      │      │       ├─ duty = map(servo_val, -1.0, 1.0, -max_duty, max_duty)
+      │      │       ├─ mc_interface_set_duty(duty)
+      │      │       └─ send_duty = true
+      │      │
+      │      ├─ case PPM_CTRL_TYPE_PID:
+      │      ├─ case PPM_CTRL_TYPE_PID_NOREV:
+      │      │   ├─ if (|servo_val| < 0.001)
+      │      │   │   └─ pulses_without_power++
+      │      │   │
+      │      │   └─ if (!(pulses_without_power < MIN && safe_start))
+      │      │       ├─ rpm = servo_val * config.pid_max_erpm
+      │      │       ├─ mc_interface_set_pid_speed(rpm)
+      │      │       └─ send_current = true
+      │      │
+      │      ├─ case PPM_CTRL_TYPE_PID_POSITION_180:
+      │      ├─ case PPM_CTRL_TYPE_PID_POSITION_360:
+      │      │   ├─ if (|servo_val| < 0.02)
+      │      │   │   └─ pulses_without_power++
+      │      │   │
+      │      │   ├─ Calculate target angle
+      │      │   │  ├─ if (POSITION_180): angle = servo_val * 180  // -180 to +180
+      │      │   │  └─ if (POSITION_360): angle = servo_val * 360  // 0 to +360
+      │      │   │
+      │      │   └─ Smart safe start for position mode
+      │      │       ├─ if (not in position mode yet)
+      │      │       │   └─ if (|angle - current_pos| < 10°)
+      │      │       │       └─ mc_interface_set_pid_pos(angle)
+      │      │       │          └─ [Enter position mode only when close]
+      │      │       └─ else
+      │      │           └─ mc_interface_set_pid_pos(angle)
+      │      │
+      │      └─ case PPM_CTRL_TYPE_CURRENT_SMART_REV:
+      │           ├─ [Advanced reverse with automatic duty mode]
+      │           ├─ Switches to duty control for smooth reverse
+      │           └─ Uses traction control for multiple motors
+      │
+      ├─ Apply safe start logic
+      │  └─ if (pulses_without_power < MIN_PULSES && safe_start)
+      │      ├─ if (pulses_without_power == pulses_without_power_before)
+      │      │   └─ pulses_without_power = 0  // Reset if stuck
+      │      │
+      │      ├─ if (servoError)
+      │      │   └─ continue  // Don't drive motor
+      │      │
+      │      └─ if (current_mode)
+      │          └─ current = 0.0  // Zero current during safe start
+      │
+      ├─ Handle multi-ESC traction control and synchronization
+      │  └─ if (config.multi_esc)
+      │      ├─ Collect RPM from all ESCs via CAN
+      │      ├─ Find highest and lowest RPM
+      │      ├─ Apply traction control algorithm
+      │      │  └─ Reduce current to faster motors
+      │      └─ Send commands to slave ESCs
+      │
+      └─ Send final motor command
+          └─ if (current_mode)
+              ├─ if (current_mode_brake)
+              │   ├─ mc_interface_set_brake_current(|current|)
+              │   └─ [Multi-ESC: comm_can_set_current_brake_rel(id, |servo_val|)]
+              │
+              └─ else
+                  ├─ mc_interface_set_current(current_out)
+                  └─ [Multi-ESC: comm_can_set_current_rel(id, servo_val)]
+                      └─ [With traction control if enabled]
+```
+
+#### ISR Callback (Servo Decoder)
+
+**Triggered on each PPM pulse edge:**
+```c
+static void servodec_func(void) {
+    ppm_rx = true;  // Set flag
+    chSysLockFromISR();
+    chEvtSignalI(ppm_tp, (eventmask_t)1);  // Wake thread
+    chSysUnlockFromISR();
+}
+```
+
+#### Key ChibiOS APIs Used
+- `chRegSetThreadName()` - Register thread name
+- `chThdGetSelfX()` - Get thread pointer for ISR signaling
+- `chEvtWaitAnyTimeout()` - Event-driven with timeout
+- `chEvtSignalI()` - Signaled from servo decoder ISR
+- `chVTGetSystemTimeX()` - Timestamp for ramping
+- `chVTTimeElapsedSinceX()` - Delta time calculation
+
+#### Function Calls Summary
+1. `servodec_set_pulse_options()` - Configure pulse width range
+2. `servodec_init()` - Initialize timer input capture
+3. `servodec_get_servo()` - Read decoded servo value
+4. `servodec_get_time_since_update()` - Check for signal loss
+5. `timeout_reset()` - Reset watchdog on valid pulse
+6. `mc_interface_get_configuration()` - Read motor config
+7. `mc_interface_get_rpm()` - Read current RPM
+8. `app_is_output_disabled()` - Check if output disabled
+9. `timeout_has_timeout()` - Check timeout status
+10. `mc_interface_get_fault()` - Check fault status
+11. `utils_deadband()` - Apply dead zone
+12. `utils_throttle_curve()` - Apply exponential curve
+13. `utils_step_towards()` - Ramping function
+14. `mc_interface_set_current()` - Send current command
+15. `mc_interface_set_brake_current()` - Send brake command
+16. `mc_interface_set_duty()` - Send duty cycle command
+17. `mc_interface_set_pid_speed()` - Send speed command
+18. `mc_interface_set_pid_pos()` - Send position command
+19. `comm_can_set_current()` / `_brake()` / `_duty()` - Multi-ESC commands
+
+#### Control Modes Supported
+- `PPM_CTRL_TYPE_CURRENT` - Current control, bidirectional
+- `PPM_CTRL_TYPE_CURRENT_NOREV` - Current control, forward only
+- `PPM_CTRL_TYPE_CURRENT_NOREV_BRAKE` - Forward + brake
+- `PPM_CTRL_TYPE_CURRENT_SMART_REV` - Smart reverse with duty mode
+- `PPM_CTRL_TYPE_CURRENT_BRAKE_REV_HYST` - Reverse with hysteresis
+- `PPM_CTRL_TYPE_DUTY` - Duty cycle control
+- `PPM_CTRL_TYPE_DUTY_NOREV` - Duty cycle, forward only
+- `PPM_CTRL_TYPE_PID` - Speed (RPM) control
+- `PPM_CTRL_TYPE_PID_NOREV` - Speed control, forward only
+- `PPM_CTRL_TYPE_PID_POSITION_180` - Position control ±180°
+- `PPM_CTRL_TYPE_PID_POSITION_360` - Position control 0-360°
+
+#### Timing Characteristics
+- **Event-driven:** Triggered by PPM pulses (typically 50 Hz from RC receiver)
+- **Timeout check:** 2ms (500 Hz maximum)
+- **Typical execution:** 50-100 Hz (matches RC receiver update rate)
+- **CPU Usage:** Low (~0.5% at 50 Hz)
+- **Response latency:** <2ms from pulse to motor command
+
+#### PPM Signal Characteristics
+- **Standard RC:** 1000-2000 µs pulse width, 20ms period (50 Hz)
+- **Center:** 1500 µs = neutral
+- **Configurable range:** Can adjust min/max/center
+- **Median filter:** Reduces noise from poor quality receivers
+
+#### Safety Features
+- **Safe start:** Requires neutral stick for 50 pulses (~1 second) before enabling
+- **Timeout:** Automatic brake on signal loss
+- **Deadband:** Prevents drift from stick not perfectly centered
+- **Ramping:** Prevents sudden acceleration/deceleration
+- **Direction hysteresis:** Prevents accidental reverse (some modes)
+
+#### Multi-ESC Features
+- **Synchronized control:** All ESCs receive same command
+- **Traction control:** Reduces wheel slip
+- **CAN communication:** Commands sent to slave ESCs
+- **Health monitoring:** Only controls ESCs with recent CAN updates (<100ms)
+
+#### Notes
+- Most common input method for electric skateboards and RC vehicles
+- RAM4 placement for faster access (time-critical)
+- Event-driven design minimizes CPU usage
+- Extensive configurability for different use cases
+- Supports both hobby RC and custom PPM sources
+
