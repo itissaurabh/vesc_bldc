@@ -1407,3 +1407,538 @@ static void servodec_func(void) {
 - Extensive configurability for different use cases
 - Supports both hobby RC and custom PPM sources
 
+---
+
+### ADC Thread
+
+**File:** `applications/app_adc.c:162-641`
+**Created at:** `app_adc.c:100` via `app_adc_start()`
+**Priority:** `NORMALPRIO` (64)
+**Execution Rate:** Configurable (typically 100-1000 Hz)
+**Stack Size:** 512 bytes (in RAM4 for performance)
+
+#### Purpose
+Reads analog throttle inputs (0-3.3V) for motor control. Common for e-bikes, e-scooters with twist/thumb throttles. Supports dual ADC inputs, buttons for reverse/cruise control, and PAS integration.
+
+#### Thread Configuration
+```c
+__attribute__((section(".ram4"))) static THD_WORKING_AREA(adc_thread_wa, 512);
+chThdCreateStatic(adc_thread_wa, sizeof(adc_thread_wa),
+                  NORMALPRIO, adc_thread, NULL);
+```
+
+#### Call Flow Summary
+
+**Entry Point:** `adc_thread()`
+
+```
+adc_thread()
+  ├─ chRegSetThreadName("APP_ADC")
+  │
+  └─ for(;;)  // Main loop
+      │
+      ├─ Sleep based on configured update rate
+      │  └─ chThdSleep(CH_CFG_ST_FREQUENCY / config.update_rate_hz)
+      │     └─ [Typically 10ms for 100 Hz, 1ms for 1000 Hz]
+      │
+      ├─ Read primary ADC input (throttle)
+      │  ├─ pwr = ADC_VOLTS(ADC_IND_EXT)  // Read voltage 0-3.3V
+      │  ├─ if (adc_detached): pwr = adc1_override  // LispBM override
+      │  ├─ Apply low-pass filter: UTILS_LP_MOVING_AVG_APPROX(read_filter, pwr, FILTER_SAMPLES)
+      │  ├─ Check voltage range: range_ok = (voltage >= min && voltage <= max)
+      │  └─ Map to [0.0, 1.0]: pwr = utils_map(pwr, voltage_start, voltage_end, 0.0, 1.0)
+      │
+      ├─ Read secondary ADC input (brake, optional)
+      │  ├─ brake = ADC_VOLTS(ADC_IND_EXT2)
+      │  ├─ if (adc_detached): brake = adc2_override
+      │  ├─ Apply filter and mapping
+      │  └─ decoded_level2 = brake
+      │
+      ├─ Read button inputs (cruise control, reverse)
+      │  ├─ if (use_rx_tx_as_buttons):
+      │  │   ├─ cc_button = !palReadPad(HW_UART_TX_PORT, HW_UART_TX_PIN)
+      │  │   └─ rev_button = !palReadPad(HW_UART_RX_PORT, HW_UART_RX_PIN)
+      │  └─ else:
+      │      └─ rev_button = !palReadPad(HW_ICU_GPIO, HW_ICU_PIN)
+      │
+      ├─ Apply mode-specific processing
+      │  └─ switch (ctrl_type)
+      │      ├─ CENTER modes: Map voltage relative to center point
+      │      │   └─ if (voltage < center): map(voltage, start, center, -1.0, 0.0)
+      │      │       else: map(voltage, center, end, 0.0, 1.0)
+      │      │
+      │      ├─ ADC brake modes: pwr -= brake (differential control)
+      │      │
+      │      └─ BUTTON reverse modes: if (rev_button): pwr = -pwr
+      │
+      ├─ Apply deadband, throttle curve, ramping
+      │  ├─ utils_deadband(&pwr, config.hyst, 1.0)
+      │  ├─ pwr = utils_throttle_curve(pwr, exp, exp_brake, mode)
+      │  └─ utils_step_towards(&pwr_ramp, pwr, ramp_step)
+      │
+      ├─ Process control type and calculate command
+      │  └─ switch (config.ctrl_type)
+      │      │
+      │      ├─ ADC_CTRL_TYPE_CURRENT modes:
+      │      │   ├─ PAS integration: if (app_pas_is_running())
+      │      │   │   └─ pwr = utils_max_abs(pwr, app_pas_get_current_target_rel())
+      │      │   │       └─ [Use higher of throttle or pedal assist]
+      │      │   ├─ current_rel = pwr
+      │      │   └─ if (brake mode && pwr < 0): current_mode_brake = true
+      │      │
+      │      ├─ ADC_CTRL_TYPE_DUTY modes:
+      │      │   └─ mc_interface_set_duty(map(pwr, -1.0, 1.0, -max_duty, max_duty))
+      │      │
+      │      └─ ADC_CTRL_TYPE_PID modes:
+      │          └─ mc_interface_set_pid_speed(pwr * max_erpm)
+      │
+      ├─ Apply safe start logic
+      │  └─ if (ms_without_power < MIN_MS_WITHOUT_POWER && safe_start)
+      │      └─ mc_interface_set_brake_current(timeout_brake)
+      │         └─ [Require 500ms at zero before enabling]
+      │
+      ├─ Cruise control feature (CC button)
+      │  └─ if (current_mode && cc_button && |pwr| < 0.001)
+      │      ├─ Capture current RPM: pid_rpm = rpm_filtered
+      │      └─ mc_interface_set_pid_speed(pid_rpm)
+      │         └─ [Maintain speed when button pressed, throttle at zero]
+      │
+      ├─ Multi-ESC traction control
+      │  └─ if (config.multi_esc && config.tc)
+      │      ├─ Collect RPM from all ESCs via CAN
+      │      ├─ Find lowest RPM (slowest wheel)
+      │      ├─ Calculate diff = rpm_each - rpm_lowest
+      │      ├─ if (diff > tc_max_diff):
+      │      │   └─ current_out = map(diff, 0, tc_max_diff, current_rel, 0.0)
+      │      │      └─ [Reduce current to faster wheel]
+      │      └─ comm_can_set_current_rel(id, current_out)
+      │
+      └─ Send motor command
+          └─ if (current_mode):
+              ├─ if (current_mode_brake):
+              │   └─ mc_interface_set_brake_current_rel(current_rel)
+              └─ else:
+                  └─ mc_interface_set_current_rel(current_out)
+```
+
+#### Key ChibiOS APIs Used
+- `chRegSetThreadName()` - Register thread name
+- `chThdSleep()` - Variable rate sleep based on configuration
+- `palReadPad()` - Read button GPIO pins
+
+#### Function Calls Summary
+1. `ADC_VOLTS()` - Read ADC voltage (2 channels)
+2. `palReadPad()` - Read button states
+3. `UTILS_LP_MOVING_AVG_APPROX()` - Low-pass filtering
+4. `utils_map()` - Voltage to control value mapping
+5. `utils_truncate_number()` - Range limiting
+6. `utils_deadband()` - Dead zone application
+7. `utils_throttle_curve()` - Exponential curve
+8. `utils_step_towards()` - Ramping
+9. `app_pas_is_running()` - Check if PAS active
+10. `app_pas_get_current_target_rel()` - Get PAS current
+11. `mc_interface_set_current_rel()` - Send current command
+12. `mc_interface_set_brake_current_rel()` - Send brake command
+13. `mc_interface_set_duty()` - Send duty command
+14. `mc_interface_set_pid_speed()` - Send speed command (cruise control)
+15. `comm_can_set_current_rel()` - Multi-ESC commands
+
+#### Control Modes Supported
+- `ADC_CTRL_TYPE_CURRENT` - Current control, bidirectional
+- `ADC_CTRL_TYPE_CURRENT_REV_CENTER` - Center voltage = neutral
+- `ADC_CTRL_TYPE_CURRENT_REV_BUTTON` - Button for reverse
+- `ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER` - Center brake, button reverse
+- `ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_CENTER` - Forward + center brake
+- `ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON` - Forward + button brake
+- `ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_ADC` - Forward + ADC2 brake
+- `ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC` - Bidirectional + ADC2 brake
+- `ADC_CTRL_TYPE_DUTY` / `_REV_CENTER` / `_REV_BUTTON` - Duty cycle modes
+- `ADC_CTRL_TYPE_PID` / `_REV_CENTER` / `_REV_BUTTON` - Speed control modes
+
+#### Unique Features
+
+**1. Dual ADC Inputs:**
+- ADC1: Primary throttle input
+- ADC2: Secondary brake/throttle input
+- Differential mode: motor_command = ADC1 - ADC2
+
+**2. PAS Integration:**
+- Automatically combines with pedal assist sensor
+- Uses higher of throttle or PAS current
+- Seamless transition between pedal and throttle
+
+**3. Cruise Control:**
+- Press CC button with throttle at zero
+- Captures and maintains current speed
+- Releases when throttle applied again
+
+**4. Button Configurations:**
+- Can use UART TX/RX pins as buttons
+- Cruise control button
+- Reverse button
+- Configurable polarity (active high/low)
+
+**5. Voltage Range Checking:**
+- Monitors if ADC voltage is within expected range
+- Prevents control when sensor disconnected
+- Auto-brake on out-of-range condition
+
+#### Timing Characteristics
+- **Configurable rate:** 100-1000 Hz via `config.update_rate_hz`
+- **Typical:** 100 Hz (10ms) for smoothness, low CPU
+- **High performance:** 1000 Hz (1ms) for racing applications
+- **CPU Usage:** ~0.5% at 100 Hz, ~2% at 1000 Hz
+- **Response latency:** 1-10ms depending on rate
+
+#### Safety Features
+- **Safe start:** Requires 500ms at zero throttle before enabling
+- **Range checking:** Disables output if ADC out of range (sensor fault)
+- **Filtering:** Reduces noise from long wires
+- **Timeout:** Automatic brake if no valid commands
+- **Multi-ESC health:** Only controls ESCs with recent CAN updates
+
+#### Common Applications
+- **E-bikes:** Thumb throttle (twist grip less common due to EU regulations)
+- **E-scooters:** Thumb or finger throttle
+- **E-skateboards:** Rarely used (PPM preferred)
+- **Wheelchairs:** Joystick control via dual ADC inputs
+- **Agricultural/industrial:** Analog control panels
+
+#### Notes
+- RAM4 placement for faster ADC access
+- Configurable update rate balances responsiveness vs CPU usage
+- Seamless PAS integration for e-bikes
+- Cruise control useful for long rides
+- Traction control prevents wheel spin on dual motor setups
+- Can override via LispBM for custom control algorithms
+
+---
+
+### Other Application Threads (Summary)
+
+The following application threads follow similar patterns to PPM and ADC. They all:
+- Read a specific input type
+- Apply filtering, mapping, and safety logic
+- Send motor control commands
+- Support multi-ESC operation
+- Implement safe start and timeout handling
+
+#### PAS Thread (Pedal Assist Sensor)
+
+**File:** `applications/app_pas.c`
+**Purpose:** E-bike pedal assist using hall sensor or reed switch
+**Key Features:**
+- Detects pedal rotation from magnetic sensor
+- Configurable assist levels (0-100%)
+- Pedal cadence (RPM) measurement
+- Torque sensor support (via ADC)
+- Ramp-up on pedal start
+- Auto-cutoff when pedaling stops
+- Integrates with ADC throttle
+
+**Operation:**
+1. Hall sensor ISR detects magnet passing
+2. Calculate pedal RPM from pulse timing
+3. Map pedal RPM to motor current (assist level)
+4. Gradually ramp current when pedaling starts
+5. Cut current when pedaling stops or backwards
+
+#### Nunchuk Thread (Wii Controller)
+
+**File:** `applications/app_nunchuk.c`
+**Purpose:** Wii Nunchuk controller for wireless control
+**Key Features:**
+- I2C communication with Nunchuk
+- Joystick X/Y axis input
+- C/Z button support
+- Accelerometer data (tilt control)
+- Wireless control via Wii extension cable
+- Button combinations for modes
+
+**Operation:**
+1. Poll Nunchuk via I2C at 100 Hz
+2. Read joystick position, buttons, accelerometer
+3. Map joystick Y-axis to throttle
+4. C button: cruise control or brake
+5. Z button: reverse enable
+6. Send motor commands based on input
+
+---
+
+## Communication Threads
+
+### USB Serial Thread
+
+**Managed by:** `comm/comm_usb.c` and ChibiOS USB stack
+**Purpose:** USB virtual COM port for VESC Tool communication
+**Key Features:**
+- USB CDC (Communications Device Class)
+- Packet-based protocol (COMM_PACKET_ID_...)
+- Automatic USB enumeration and reconnection
+- DMA-based transfers for efficiency
+- Thread-safe packet queue
+
+**Operation:**
+- ChibiOS USB driver handles low-level USB
+- Dedicated RX thread processes incoming packets
+- Packet parser validates CRC and dispatches commands
+- TX queue for outgoing telemetry/responses
+
+### CAN RX Thread
+
+**File:** `comm/comm_can.c` (CAN receive thread)
+**Purpose:** Receive and process CAN bus messages
+**Priority:** NORMALPRIO
+**Rate:** Event-driven (triggered by CAN hardware)
+
+**Key Features:**
+- Mailbox-based CAN message queue
+- Extended ID support (29-bit)
+- Multi-master operation
+- Status message broadcasting
+- Remote motor control
+- Firmware updates over CAN
+
+**Operation:**
+1. CAN hardware triggers RX interrupt
+2. Message placed in CAN mailbox (hardware FIFO)
+3. CAN RX thread woken by event
+4. Parse CAN ID and data
+5. Dispatch to appropriate handler:
+   - VESC protocol commands
+   - Status updates from other ESCs
+   - NMT (Network Management)
+   - Custom app messages
+
+### CAN TX Thread
+
+**File:** `comm/comm_can.c` (CAN transmit thread)
+**Purpose:** Transmit CAN messages with priority queue
+**Priority:** NORMALPRIO
+**Rate:** Event-driven + periodic status broadcast
+
+**Key Features:**
+- Priority-based TX queue
+- Periodic status broadcasts (configurable 10-1000 Hz)
+- Automatic retry on bus arbitration loss
+- Bus-off recovery
+
+**Operation:**
+1. Status broadcast timer expires OR command queued
+2. CAN TX thread woken
+3. Select highest priority message from queue
+4. Attempt transmission
+5. If bus busy: retry or queue for later
+6. Feed watchdog counter for timeout thread
+
+---
+
+## Subsystem Threads
+
+### IMU Thread
+
+**File:** `imu/imu.c`
+**Purpose:** Inertial Measurement Unit data acquisition
+**Features:**
+- I2C/SPI communication with IMU chip (MPU9x50, ICM20x48, BMI160, etc.)
+- 6-axis (accel + gyro) or 9-axis (+ magnetometer)
+- AHRS (Attitude and Heading Reference System)
+- Madgwick or Mahony sensor fusion
+- Configurable sample rate (100-1000 Hz)
+- Orientation estimation (roll, pitch, yaw)
+
+**Applications:**
+- Balance boards/one-wheels
+- Tilt-based throttle control
+- Anti-slip detection
+- Data logging
+
+### NRF Thread
+
+**File:** `nrf/nrf_driver.c`
+**Purpose:** Nordic NRF24L01+ wireless communication
+**Features:**
+- 2.4 GHz wireless link
+- Remote control via NRF module
+- Wireless firmware updates
+- Telemetry streaming
+- Multiple channel support
+- Auto-retry and ACK
+
+**Operation:**
+- SPI communication with NRF chip
+- Interrupt-driven RX
+- Packet processing similar to UART
+- Integrates with VESC protocol
+
+### Encoder Thread
+
+**File:** `encoder/encoder.c`
+**Purpose:** Position sensor interface
+**Supported Types:**
+- ABI incremental encoders
+- SPI absolute encoders (AS5047, AS5x47U, etc.)
+- SinCos encoders (Renishaw, RLS, etc.)
+- Hall sensors
+- Resolvers
+
+**Features:**
+- Index pulse detection
+- High-resolution position (sub-degree)
+- Encoder error detection
+- Calibration and offset compensation
+- Multiple update rates based on type
+
+### LispBM Thread
+
+**File:** `lispBM/lispif.c`
+**Purpose:** Lisp interpreter for custom scripts
+**Features:**
+- Full Lisp language support
+- Direct hardware access (GPIO, ADC, CAN, I2C, etc.)
+- Custom control algorithms
+- Event system integration
+- Real-time execution
+- Persistent script storage in flash
+- REPL (Read-Eval-Print Loop) via VESC Tool
+
+**Operation:**
+1. Load Lisp script from flash on boot
+2. Parse and compile to bytecode
+3. Execute in dedicated thread
+4. Can override application threads
+5. Access all motor control functions
+6. Respond to events (button press, CAN message, etc.)
+
+**Applications:**
+- Custom throttle curves
+- Advanced traction control
+- Multi-motor coordination
+- Custom lighting patterns
+- Telemetry processing
+- Sensor fusion algorithms
+
+---
+
+## Summary
+
+This document has detailed the call flow for all major threads in the VESC firmware:
+
+**System Threads (3):**
+- LED status indication
+- Periodic position reporting
+- Flash integrity monitoring
+
+**Motor Control Threads (4):**
+- Timer/housekeeping
+- Fault emergency stop
+- Statistics persistence
+- Sample data streaming
+
+**Safety Thread (1):**
+- Timeout and watchdog
+
+**Application Threads (4+):**
+- PPM RC input
+- ADC analog throttle
+- PAS pedal assist
+- Nunchuk wireless controller
+- (+ others like UART app, balance app, custom app)
+
+**Communication Threads (3):**
+- USB virtual serial
+- CAN receive
+- CAN transmit
+
+**Subsystem Threads (4+):**
+- IMU sensor fusion
+- NRF wireless
+- Encoder position
+- LispBM scripting
+- (+ others like BMS, shutdown monitoring)
+
+### Thread Interaction Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         USER INPUT                               │
+│    (RC, Throttle, Pedal, CAN, USB, Nunchuk, LispBM)            │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              APPLICATION THREADS                                 │
+│  (PPM, ADC, PAS, Nunchuk) - NORMALPRIO - 50-1000 Hz            │
+│  ├─ Read input                                                  │
+│  ├─ Apply filtering, curves, ramping                           │
+│  ├─ Check timeouts and faults                                  │
+│  └─ Call mc_interface_set_xxx()                                │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              MOTOR CONTROL INTERFACE                             │
+│  (mc_interface.c)                                               │
+│  ├─ Validate input ranges                                       │
+│  ├─ Apply direction multiplier                                  │
+│  ├─ Check for faults/locks                                      │
+│  └─ Call mcpwm_foc_set_xxx()                                   │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              FOC IMPLEMENTATION                                  │
+│  (mcpwm_foc.c) - Thread context                                │
+│  ├─ Store setpoint in motor state                              │
+│  ├─ Apply soft start ramping                                    │
+│  ├─ Check current/voltage/temp limits                          │
+│  └─ motor->m_iq_set = target_current                           │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │
+                   │ (Thread sleeps, ISR runs independently)
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              FOC ISR (40 kHz)                                    │
+│  ├─ TIM1 update triggers ADC conversion                        │
+│  ├─ ADC DMA complete interrupt                                  │
+│  ├─ Read phase currents (ADC)                                   │
+│  ├─ Clarke transform (abc → αβ)                                 │
+│  ├─ Park transform (αβ → dq)                                    │
+│  ├─ Read setpoint: iq_target = motor->m_iq_set                 │
+│  ├─ PI current controllers                                      │
+│  ├─ Inverse Park (dq → αβ)                                      │
+│  ├─ Space Vector Modulation                                     │
+│  ├─ Update PWM duty cycles (TIM1->CCR1/2/3)                    │
+│  └─ Feed watchdog counter                                       │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              MOTOR ROTATES                                       │
+└─────────────────────────────────────────────────────────────────┘
+
+Parallel monitoring threads:
+- TIMEOUT thread (100 Hz): Checks watchdog counter, applies brake if timeout
+- FAULT STOP thread (event): Immediately stops motor on fault
+- STATISTICS thread (1 Hz): Saves amp-hours, odometer to flash
+- PERIODIC thread (100 Hz): Sends position data to host
+- LED thread (100 Hz): Visual status feedback
+```
+
+### Key Takeaways
+
+1. **Time-Decoupled Architecture:** Application threads (50-1000 Hz) set targets, FOC ISR (40 kHz) tracks them independently
+2. **Event-Driven Design:** Many threads sleep until signaled (PPM pulses, CAN messages, sample buffers full)
+3. **Priority Separation:** Fault stop (HIGHPRIO) > FOC ISR > Normal threads (NORMALPRIO) > Flash check (LOWPRIO)
+4. **Thread Safety:** ChibiOS synchronization primitives prevent race conditions
+5. **Watchdog Protection:** Dual-layer safety (software timeout + hardware IWDG)
+6. **Extensibility:** LispBM thread allows custom logic without firmware recompilation
+
+---
+
+**Document Version:** 1.0
+**Date:** 2025-11-11
+**VESC Firmware Version:** Based on current master branch
+**Author:** AI-generated technical documentation
+
